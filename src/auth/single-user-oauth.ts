@@ -45,6 +45,7 @@ type PendingAuthorization = {
   params: AuthorizationParams;
   expiresAt: number;
   failedAttempts: number;
+  authorizationCode?: string;
 };
 
 type AuthorizationCode = PendingAuthorization;
@@ -107,20 +108,31 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!client.redirect_uris.includes(params.redirectUri)) {
       throw new InvalidRequestError("Unregistered redirect URI");
     }
+    const redirectOrigin = new URL(params.redirectUri).origin;
     this.pruneTransientState();
     const pendingId = secureToken();
-    this.pending.set(hashToken(pendingId), {
+    const pendingKey = hashToken(pendingId);
+    this.pending.set(pendingKey, {
       client,
       params: { ...params, scopes: params.scopes?.length ? params.scopes : [SUPPORTED_SCOPE] },
       expiresAt: Date.now() + AUTHORIZATION_TTL_MS,
       failedAttempts: 0,
     });
+    this.logger.info(
+      {
+        clientId: client.client_id,
+        pendingFingerprint: fingerprintHash(pendingKey),
+        pendingCount: this.pending.size,
+        expiresInSeconds: AUTHORIZATION_TTL_MS / 1_000,
+      },
+      "Created MCP OAuth authorization request",
+    );
     res
       .status(200)
       .set({
         "Cache-Control": "no-store",
         "Content-Type": "text/html; charset=utf-8",
-        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${redirectOrigin}; base-uri 'none'; frame-ancestors 'none'`,
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
       })
@@ -135,25 +147,91 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const suppliedPassword = typeof body.password === "string" ? body.password : "";
     const key = hashToken(pendingId);
     const pending = this.pending.get(key);
-    if (!pending || pending.expiresAt < Date.now()) {
+    if (!pending) {
+      this.logger.warn(
+        {
+          ip: req.ip,
+          pendingPresent: pendingId.length > 0,
+          pendingFingerprint: pendingId.length > 0 ? fingerprintHash(key) : undefined,
+          pendingCount: this.pending.size,
+          reason: "missing",
+        },
+        "Rejected MCP OAuth approval request",
+      );
+      res.status(400).type("text/plain").send("Authorization request expired. Start the connection again.");
+      return Promise.resolve();
+    }
+    const now = Date.now();
+    if (pending.expiresAt < now) {
       this.pending.delete(key);
+      if (pending.authorizationCode) this.codes.delete(hashToken(pending.authorizationCode));
+      this.logger.warn(
+        {
+          ip: req.ip,
+          pendingPresent: true,
+          pendingFingerprint: fingerprintHash(key),
+          pendingCount: this.pending.size,
+          reason: "expired",
+          ageMs: AUTHORIZATION_TTL_MS + now - pending.expiresAt,
+        },
+        "Rejected MCP OAuth approval request",
+      );
       res.status(400).type("text/plain").send("Authorization request expired. Start the connection again.");
       return Promise.resolve();
     }
     if (!safeEqual(this.password, suppliedPassword)) {
       pending.failedAttempts += 1;
       if (pending.failedAttempts >= 5) this.pending.delete(key);
-      this.logger.warn({ ip: req.ip }, "Rejected MCP OAuth approval password");
+      this.logger.warn(
+        {
+          ip: req.ip,
+          pendingFingerprint: fingerprintHash(key),
+          failedAttempts: pending.failedAttempts,
+        },
+        "Rejected MCP OAuth approval password",
+      );
       res.status(401).type("text/plain").send("Authorization was rejected. Start the connection again if needed.");
       return Promise.resolve();
     }
-    this.pending.delete(key);
+    if (pending.authorizationCode) {
+      const authorizationCode = pending.authorizationCode;
+      if (this.codes.has(hashToken(authorizationCode))) {
+        this.logger.info(
+          {
+            ip: req.ip,
+            clientId: pending.client.client_id,
+            pendingFingerprint: fingerprintHash(key),
+            ageMs: AUTHORIZATION_TTL_MS - Math.max(0, pending.expiresAt - now),
+          },
+          "Replayed MCP OAuth approval redirect",
+        );
+        redirectAuthorization(res, pending, authorizationCode);
+      } else {
+        this.logger.info(
+          {
+            ip: req.ip,
+            clientId: pending.client.client_id,
+            pendingFingerprint: fingerprintHash(key),
+          },
+          "Ignored duplicate MCP OAuth approval after code exchange",
+        );
+        res.status(200).type("text/plain").send("Authorization is already complete. You can return to ChatGPT.");
+      }
+      return Promise.resolve();
+    }
+    this.logger.info(
+      {
+        ip: req.ip,
+        clientId: pending.client.client_id,
+        pendingFingerprint: fingerprintHash(key),
+        ageMs: AUTHORIZATION_TTL_MS - Math.max(0, pending.expiresAt - now),
+      },
+      "Approved MCP OAuth authorization request",
+    );
     const code = secureToken();
+    pending.authorizationCode = code;
     this.codes.set(hashToken(code), pending);
-    const target = new URL(pending.params.redirectUri);
-    target.searchParams.set("code", code);
-    if (pending.params.state) target.searchParams.set("state", pending.params.state);
-    res.redirect(302, target.href);
+    redirectAuthorization(res, pending, code);
     return Promise.resolve();
   }
 
@@ -162,6 +240,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<string> {
     const code = this.getCode(client, authorizationCode);
+    this.logger.info(
+      {
+        clientId: client.client_id,
+        authorizationCodeFingerprint: fingerprintHash(hashToken(authorizationCode)),
+      },
+      "Loaded MCP OAuth authorization code challenge",
+    );
     return Promise.resolve(code.params.codeChallenge);
   }
 
@@ -179,6 +264,13 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
     if (resource) this.validateResource(resource);
     this.codes.delete(key);
+    this.logger.info(
+      {
+        clientId: client.client_id,
+        authorizationCodeFingerprint: fingerprintHash(key),
+      },
+      "Exchanged MCP OAuth authorization code",
+    );
     return this.issueTokenPair(client.client_id, code.params.scopes ?? [SUPPORTED_SCOPE]);
   }
 
@@ -325,6 +417,17 @@ function secureToken(): string {
 
 function hashToken(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function fingerprintHash(hash: string): string {
+  return hash.slice(0, 12);
+}
+
+function redirectAuthorization(res: Response, pending: PendingAuthorization, code: string): void {
+  const target = new URL(pending.params.redirectUri);
+  target.searchParams.set("code", code);
+  if (pending.params.state) target.searchParams.set("state", pending.params.state);
+  res.redirect(302, target.href);
 }
 
 function safeEqual(expected: string, actual: string): boolean {

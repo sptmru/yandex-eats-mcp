@@ -146,6 +146,9 @@ describe("Streamable HTTP server", () => {
       }).toString();
       const authorization = await fetch(authorizeUrl);
       expect(authorization.status).toBe(200);
+      expect(authorization.headers.get("content-security-policy")).toContain(
+        "form-action 'self' https://chatgpt.com",
+      );
       const approvalPage = await authorization.text();
       expect(approvalPage).toContain("Authorize Yandex Eats MCP");
       const pending = /name="pending" value="([^"]+)"/.exec(approvalPage)?.[1];

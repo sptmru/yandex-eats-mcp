@@ -29,6 +29,29 @@ export async function createHttpApp(
     res.setHeader("Cache-Control", "no-store");
     next();
   });
+  app.use((req, res, next) => {
+    if (!isOAuthDiagnosticPath(req.path)) {
+      next();
+      return;
+    }
+    const startedAt = Date.now();
+    const ip = req.ip;
+    const method = req.method;
+    const path = req.path;
+    res.on("finish", () => {
+      logger.info(
+        {
+          ip,
+          method,
+          path,
+          statusCode: res.statusCode,
+          durationMs: Date.now() - startedAt,
+        },
+        "MCP OAuth HTTP request",
+      );
+    });
+    next();
+  });
 
   const authMiddleware = await configureAuth(app, config, logger);
 
@@ -83,6 +106,17 @@ export async function createHttpApp(
   app.delete("/mcp", authMiddleware, methodNotAllowed);
 
   return app;
+}
+
+function isOAuthDiagnosticPath(path: string): boolean {
+  return (
+    path === "/authorize" ||
+    path === "/token" ||
+    path === "/register" ||
+    path === "/revoke" ||
+    path === "/oauth/approve" ||
+    path.startsWith("/.well-known/")
+  );
 }
 
 async function configureAuth(app: Express, config: AppConfig, logger: Logger): Promise<RequestHandler> {
