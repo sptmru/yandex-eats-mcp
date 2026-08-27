@@ -60,7 +60,7 @@ describe("MCP contract", () => {
         cartMutationsEnabled: false,
         checkoutEnabled: false,
         placeOrderEnabled: false,
-        adultItemsSupported: false,
+        adultItemsSupported: true,
       });
     } finally {
       await mcpClient.close();

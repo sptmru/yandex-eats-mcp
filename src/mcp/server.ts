@@ -42,7 +42,7 @@ export function createYandexEatsMcpServer(
     { name: "yandex-eats-mcp", version: "0.1.0" },
     {
       instructions:
-        "Search and read tools may run automatically. Cart mutations require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Adult items, pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
+        "Search and read tools may run automatically. Cart mutations require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Items marked adult may be added to the cart; any eligibility or age-verification requirements remain enforced by Yandex Eats. Pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
     },
   );
 
@@ -184,7 +184,7 @@ export function createYandexEatsMcpServer(
     {
       title: "Add items to Yandex Eats cart",
       description:
-        "Add explicitly requested non-adult restaurant items. Call get_menu first and pass every required option. Multiple items are allowed only when all have no options.",
+        "Add explicitly requested restaurant items, including items marked adult. Call get_menu first and pass every required option. Yandex Eats remains responsible for eligibility and age verification. Multiple items are allowed only when all have no options.",
       inputSchema: {
         placeSlug: z.string().trim().min(1).max(300),
         placeBusiness: z.literal("restaurant"),
@@ -284,7 +284,7 @@ export function createYandexEatsMcpServer(
         placeOrderEnabled: z.literal(false),
         supportedShippingTypes: z.array(z.literal("delivery")),
         supportedBusinesses: z.array(z.literal("restaurant")),
-        adultItemsSupported: z.literal(false),
+        adultItemsSupported: z.literal(true),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -298,7 +298,7 @@ export function createYandexEatsMcpServer(
           placeOrderEnabled: false as const,
           supportedShippingTypes: ["delivery" as const],
           supportedBusinesses: ["restaurant" as const],
-          adultItemsSupported: false as const,
+          adultItemsSupported: true as const,
         }),
         (value) => `Cart mutations are ${value.cartMutationsEnabled ? "enabled" : "disabled"}; checkout is disabled.`,
       ),

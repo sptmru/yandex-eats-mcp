@@ -309,9 +309,6 @@ export class YandexEatsClient {
       if (!menuItem.available) {
         throw new EatsError("PLACE_UNAVAILABLE", `${menuItem.name} is currently unavailable.`);
       }
-      if (menuItem.adult) {
-        throw new EatsError("UNSUPPORTED_CART_MODE", "Adult items are disabled in this MCP release.");
-      }
       const selectedGroups = new Map(requested.options.map((group) => [group.groupId, group]));
       for (const group of menuItem.optionGroups) {
         const selected = selectedGroups.get(group.groupId);

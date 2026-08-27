@@ -89,6 +89,58 @@ describe("YandexEatsClient HTTP contract", () => {
     expect(fakeFetch).not.toHaveBeenCalled();
   });
 
+  it("allows an adult menu item to be added to the cart", async () => {
+    const directory = await temporaryDirectory();
+    const cookieFile = join(directory, "cookie");
+    await writeFile(cookieFile, "Session_id=session-value");
+    let mutationBody: unknown;
+    const fakeFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const pathname = requestUrl(input).pathname;
+      if (pathname.includes("menu/retrieve")) {
+        return Promise.resolve(jsonResponse({
+          payload: {
+            categories: [
+              {
+                id: 1,
+                name: "Drinks",
+                items: [
+                  {
+                    id: 77,
+                    name: "Beer",
+                    decimalPrice: "900",
+                    available: true,
+                    adult: true,
+                    optionsGroups: [],
+                  },
+                ],
+              },
+            ],
+          },
+        }));
+      }
+      if (pathname.includes("full-carts")) {
+        return Promise.resolve(jsonResponse({
+          cart: { place_slug: "place-one", items: [], decimal_total: "0" },
+        }));
+      }
+      if (pathname === "/api/v1/cart") {
+        mutationBody = JSON.parse(typeof init?.body === "string" ? init.body : "null");
+        return Promise.resolve(jsonResponse({ cart: {} }));
+      }
+      return Promise.reject(new Error(`Unexpected test request ${pathname}`));
+    });
+    const client = new YandexEatsClient(testConfig(directory, cookieFile, true), createLogger("silent"), fakeFetch);
+    await client.initialize();
+
+    await expect(client.addItems({
+      placeSlug: "place-one",
+      placeBusiness: "restaurant",
+      operationId: "adult-item-operation",
+      items: [{ itemId: "77", quantity: 1, options: [] }],
+    })).resolves.toMatchObject({ operationId: "adult-item-operation" });
+    expect(mutationBody).toMatchObject({ item_id: 77, quantity: 1, place_slug: "place-one" });
+  });
+
   it("does not retry an ambiguous unsafe mutation", async () => {
     const directory = await temporaryDirectory();
     const cookieFile = join(directory, "cookie");

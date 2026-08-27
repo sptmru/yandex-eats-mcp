@@ -7,11 +7,11 @@ Current release:
 - searches restaurants and matching items near one server-configured delivery point;
 - loads restaurant availability and complete menus;
 - lists and reads server-side carts;
-- can add, update, and remove ordinary restaurant cart items after an explicit feature flag is enabled;
+- can add, update, and remove restaurant cart items, including items marked adult, after an explicit feature flag is enabled;
 - protects the public MCP endpoint with a persistent single-user OAuth 2.1 + PKCE flow;
 - never exposes the Yandex cookie, Passport token, exact coordinates, phone, address, or payment data as MCP results.
 
-Checkout, `place_order`, pickup, SKU/retail carts, multiorder, adult products, and age verification are deliberately not implemented. A cart is not an order.
+Checkout, `place_order`, pickup, SKU/retail carts, and multiorder are deliberately not implemented. Adult products may be added to a restaurant cart, but the MCP does not bypass eligibility checks or perform age verification; those requirements remain enforced by Yandex Eats. A cart is not an order.
 
 ## Risk notice
 
@@ -149,7 +149,7 @@ The OAuth owner page explicitly states that it grants search/cart access only.
 | `get_place` | No | Availability and ETA |
 | `get_menu` | No | Optional local query/category filtering |
 | `get_cart` | No | Lists carts or loads one fresh cart |
-| `add_to_cart` | Yes | Validates current menu, required options, availability, and adult flag |
+| `add_to_cart` | Yes | Validates current menu, required options, and availability; adult-marked items are supported |
 | `update_cart_item` | Yes | Explicit user request only |
 | `remove_cart_item` | Yes, destructive | Never an automatic optimization |
 | `server_capabilities` | No | Reports enabled safety boundaries |
@@ -166,7 +166,7 @@ Leave this disabled through initial deployment:
 YANDEX_EATS_ENABLE_MUTATIONS=false
 ```
 
-First verify `auth_status`, `search`, `get_menu`, and `get_cart`. Then prepare one disposable non-adult restaurant item with no required modifiers, enable the flag, and perform a controlled `add_to_cart` followed by `get_cart` and removal of only the newly created `cartItemId`.
+First verify `auth_status`, `search`, `get_menu`, and `get_cart`. Then prepare one disposable restaurant item with no required modifiers, enable the flag, and perform a controlled `add_to_cart` followed by `get_cart` and removal of only the newly created `cartItemId`.
 
 ```dotenv
 YANDEX_EATS_ENABLE_MUTATIONS=true
@@ -223,5 +223,5 @@ No live test in this repository creates an order. Normal tests never contact Yan
 - `DELIVERY_LOCATION_NOT_CONFIGURED`: configure both latitude and longitude.
 - `MUTATIONS_DISABLED`: expected until the feature flag is deliberately enabled.
 - `REQUIRES_CONFIGURATION`: inspect `get_menu` and ask the user to choose required options.
-- `UNSUPPORTED_CART_MODE`: current release refuses adult/SKU/pickup flows.
+- `UNSUPPORTED_CART_MODE`: current release refuses unsupported SKU/pickup cart flows.
 - `MUTATION_STATUS_UNKNOWN`: do not retry blindly; reconcile with `get_cart`.
