@@ -1,0 +1,69 @@
+name: yandex-eats-mcp
+
+services:
+  mcp:
+    build:
+      context: .
+      target: runtime
+    image: yandex-eats-mcp:local
+    init: true
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:${MCP_BIND_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      MCP_STATE_DIR: /app/state
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      MCP_AUTH_MODE: ${MCP_AUTH_MODE:-oauth}
+      MCP_OAUTH_PASSWORD_FILE: /run/secrets/mcp_oauth_password
+      YANDEX_EATS_COOKIE_FILE: /run/secrets/yandex_eats_cookie
+      YANDEX_EATS_BASE_URL: ${YANDEX_EATS_BASE_URL:-https://eats.yandex.com}
+      YANDEX_EATS_LOCALE: ${YANDEX_EATS_LOCALE:-ru}
+      YANDEX_EATS_PLATFORM: ${YANDEX_EATS_PLATFORM:-desktop_web}
+      YANDEX_EATS_APP_VERSION: ${YANDEX_EATS_APP_VERSION:-18.43.3}
+      YANDEX_EATS_LATITUDE: ${YANDEX_EATS_LATITUDE:-}
+      YANDEX_EATS_LONGITUDE: ${YANDEX_EATS_LONGITUDE:-}
+      YANDEX_EATS_CITY: ${YANDEX_EATS_CITY:-Yerevan}
+      YANDEX_EATS_ADDRESS_LABEL: ${YANDEX_EATS_ADDRESS_LABEL:-home}
+      YANDEX_EATS_SHIPPING_TYPE: delivery
+      YANDEX_EATS_TIMEOUT_MS: ${YANDEX_EATS_TIMEOUT_MS:-15000}
+      YANDEX_EATS_ENABLE_MUTATIONS: ${YANDEX_EATS_ENABLE_MUTATIONS:-false}
+      YANDEX_EATS_MAX_SEARCH_PLACES: ${YANDEX_EATS_MAX_SEARCH_PLACES:-10}
+      YANDEX_EATS_MAX_ITEMS_PER_PLACE: ${YANDEX_EATS_MAX_ITEMS_PER_PLACE:-5}
+    volumes:
+      - yandex-eats-state:/app/state
+    secrets:
+      - yandex_eats_cookie
+      - mcp_oauth_password
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/healthz').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 15s
+
+volumes:
+  yandex-eats-state:
+
+secrets:
+  yandex_eats_cookie:
+    file: ${YANDEX_EATS_COOKIE_SECRET_FILE:-./secrets/yandex_eats_cookie}
+  mcp_oauth_password:
+    file: ${MCP_OAUTH_PASSWORD_SECRET_FILE:-./secrets/mcp_oauth_password}

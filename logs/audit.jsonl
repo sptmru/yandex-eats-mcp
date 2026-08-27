@@ -1,0 +1,7 @@
+{"ts":"2026-08-27T08:52:00.624Z","tool":"list_servers","action":"list","ok":true,"durationMs":2}
+{"ts":"2026-08-27T08:52:16.935Z","tool":"list_docker_containers","serverId":"devserver","action":"list_docker_containers","ok":true,"durationMs":233}
+{"ts":"2026-08-27T08:53:24.529Z","tool":"list_servers","action":"list","ok":true,"durationMs":1}
+{"ts":"2026-08-27T08:53:36.202Z","tool":"list_docker_containers","serverId":"devserver","action":"list_docker_containers","ok":true,"durationMs":153}
+{"ts":"2026-08-27T08:53:51.353Z","tool":"docker_logs","serverId":"devserver","action":"docker_logs","ok":true,"durationMs":131,"details":{"containerName":"yandex-eats-mcp-mcp-1","lines":40}}
+{"ts":"2026-08-27T08:55:41.652Z","tool":"list_docker_containers","serverId":"devserver","action":"list_docker_containers","ok":true,"durationMs":86}
+{"ts":"2026-08-27T08:55:41.818Z","tool":"docker_logs","serverId":"devserver","action":"docker_logs","ok":true,"durationMs":105,"details":{"containerName":"yandex-eats-mcp-mcp-1","lines":20}}
