@@ -7,6 +7,7 @@ Current release:
 - searches restaurants and matching items near one server-configured delivery point;
 - loads restaurant availability and complete menus;
 - lists and reads server-side carts;
+- monitors active orders with server-directed polling, a persistent event cursor, and optional Telegram delivery;
 - can add, update, and remove restaurant cart items, including items marked adult, after an explicit feature flag is enabled;
 - protects the public MCP endpoint with a persistent single-user OAuth 2.1 + PKCE flow;
 - never exposes the Yandex cookie, Passport token, exact coordinates, phone, address, or payment data as MCP results.
@@ -33,6 +34,10 @@ Docker: yandex-eats-mcp
    ▼
 https://eats.yandex.com
 ```
+
+The process-level `OrderMonitor` is independent of MCP request sessions. It polls Yandex's read-only order endpoints, writes sanitized state to `/app/state/order-monitor-state.json`, appends cursor-addressable events to `/app/state/order-events.jsonl`, and optionally sends a minimal Telegram message.
+
+An MCP server cannot initiate a message in a sleeping ChatGPT conversation. ChatGPT can call `get_order_events` periodically (for example from a Scheduled Task), while Telegram provides the near-real-time push channel.
 
 The MCP endpoint is `/mcp`. OAuth discovery, client registration, authorization, token, and protected-resource metadata endpoints are served by the same container. OAuth clients and hashed access/refresh tokens are persisted in the `yandex-eats-state` Docker volume. The owner password is a Docker secret and is never persisted in OAuth state.
 
@@ -76,6 +81,17 @@ unprivileged container and causes an `EACCES` startup failure.
 
 Do not paste either secret into ChatGPT, shell command arguments, logs, issues, or commits.
 
+For Telegram notifications, create a bot with BotFather, determine the destination chat ID, and put the two raw values in separate ignored files:
+
+```bash
+printf '%s\n' '<bot token>' > secrets/order_notify_telegram_token
+printf '%s\n' '<chat id>' > secrets/order_notify_telegram_chat_id
+chown root:1000 secrets/order_notify_telegram_token secrets/order_notify_telegram_chat_id
+chmod 640 secrets/order_notify_telegram_token secrets/order_notify_telegram_chat_id
+```
+
+Do not include quotes or variable names in either file. The bot must be able to message the selected chat.
+
 ## Configure the service
 
 ```bash
@@ -91,6 +107,8 @@ YANDEX_EATS_LONGITUDE=44.000000
 YANDEX_EATS_CITY=Yerevan
 YANDEX_EATS_ADDRESS_LABEL=home
 YANDEX_EATS_ENABLE_MUTATIONS=false
+YANDEX_EATS_ENABLE_ORDER_MONITORING=true
+ORDER_NOTIFY_PROVIDER=telegram
 ```
 
 `YANDEX_EATS_ADDRESS_LABEL` is safe text returned to the model. Exact coordinates stay inside the client and are never included in MCP responses.
@@ -149,6 +167,9 @@ The OAuth owner page explicitly states that it grants search/cart access only.
 | `get_place` | No | Availability and ETA |
 | `get_menu` | No | Optional local query/category filtering |
 | `get_cart` | No | Lists carts or loads one fresh cart |
+| `get_active_orders` | No | Sanitized cached active orders and monitor health |
+| `get_order_status` | No | Cached status or explicit read-only refresh |
+| `get_order_events` | No | Persistent events after an exclusive sequence cursor |
 | `add_to_cart` | Yes | Validates current menu, required options, and availability; adult-marked items are supported |
 | `update_cart_item` | Yes | Explicit user request only |
 | `remove_cart_item` | Yes, destructive | Never an automatic optimization |
@@ -157,6 +178,21 @@ The OAuth owner page explicitly states that it grants search/cart access only.
 Every mutation accepts an optional UUID `operationId`; repeating the same operation within ten minutes returns the same in-process result instead of repeating the upstream mutation. Reusing the ID with different arguments is rejected. Unsafe upstream requests are never automatically retried. If the response is lost or times out, the tool returns `MUTATION_STATUS_UNKNOWN`; call `get_cart` to reconcile.
 
 After any successful mutation, the MCP reloads and returns the server cart. Budget checks must use that fresh total and its violated constraints, not a local sum.
+
+## Order monitoring and Telegram
+
+Monitoring is independent of cart mutations and uses only read-like requests. Enable it with:
+
+```dotenv
+YANDEX_EATS_ENABLE_ORDER_MONITORING=true
+ORDER_NOTIFY_PROVIDER=telegram
+```
+
+The list and tracking intervals are supplied by Yandex and clamped by `YANDEX_EATS_ORDER_POLL_MIN_MS` / `YANDEX_EATS_ORDER_POLL_MAX_MS`. Network, 429, and 5xx failures use bounded backoff. A 401/403 creates one `monitor.auth_expired` event; after the cookie is replaced, `SIGHUP` wakes the monitor immediately and recovery produces `monitor.recovered`.
+
+The first successful snapshot is a baseline, so deploying the monitor does not notify about historical orders. Later discoveries and fingerprint changes create monotonically sequenced events. Telegram messages mask the order number and omit address, coordinates, phone, payment, map payload, and courier identity.
+
+To poll from ChatGPT, retain `nextSequence` from `get_order_events` and pass it back as `afterSequence`. The cursor is exclusive and reading does not acknowledge events for other clients.
 
 ## Enabling cart mutations
 
@@ -210,6 +246,7 @@ export YANDEX_EATS_COOKIE_FILE="$PWD/secrets/yandex_eats_cookie"
 export YANDEX_EATS_LATITUDE="40.000000"
 export YANDEX_EATS_LONGITUDE="44.000000"
 npm run test:live:readonly
+npm run test:live:orders:readonly
 ```
 
 No live test in this repository creates an order. Normal tests never contact Yandex.
@@ -217,6 +254,7 @@ No live test in this repository creates an order. Normal tests never contact Yan
 ## Operational notes
 
 - State under `/app/state` includes sensitive cookie-jar and OAuth data; back it up and protect the Docker host accordingly.
+- `/readyz` reports monitor health without making an upstream request or exposing order IDs.
 - Logs include endpoint, status, duration, and Yandex correlation IDs. Request/response bodies, cookies, authorization headers, session IDs, phone, address, and payment fields are redacted or not logged.
 - `AUTH_NOT_CONFIGURED`: cookie secret is missing or unreadable.
 - `AUTH_EXPIRED`: copy a fresh browser Cookie header.

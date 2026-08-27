@@ -89,6 +89,43 @@ describe("YandexEatsClient HTTP contract", () => {
     expect(fakeFetch).not.toHaveBeenCalled();
   });
 
+  it("wires all read-only order endpoints without exposing order numbers in the path", async () => {
+    const directory = await temporaryDirectory();
+    const cookieFile = join(directory, "cookie");
+    await writeFile(cookieFile, "Session_id=session-value; webapitoken=web-api-value");
+    const calls: Array<{ url: URL; init?: RequestInit }> = [];
+    const fakeFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = requestUrl(input);
+      calls.push({ url, ...(init ? { init } : {}) });
+      if (url.pathname.endsWith("tracking-for-desktop")) {
+        return Promise.resolve(jsonResponse({ tracked_order: { order_nr: "12345" }, polling_policy: { full_update_after: 7 } }));
+      }
+      if (url.pathname.endsWith("order-details")) {
+        return Promise.resolve(jsonResponse({ order: { order_nr: "12345" }, update_settings: { period_s: 5 } }));
+      }
+      return Promise.resolve(jsonResponse({ orders: [], update_settings: { update_period: 10, order_nrs_to_update: [] } }));
+    });
+    const client = new YandexEatsClient(testConfig(directory, cookieFile, false), createLogger("silent"), fakeFetch);
+    await client.initialize();
+
+    await client.listOrders("history");
+    await client.refreshOrders(["12345"]);
+    await client.getOrderDetails("12345", { cursor: "opaque" });
+    await client.getDesktopTracking("12345");
+
+    expect(calls.map((call) => [call.init?.method, call.url.pathname])).toEqual([
+      ["POST", "/eats/v1/orders-info/v1/orders"],
+      ["POST", "/eats/v1/orders-info/v1/refresh-orders"],
+      ["POST", "/eats/v1/orders-info/v1/desktop/order-details"],
+      ["GET", "/eats/v1/eats-orders-tracking/v1/tracking-for-desktop"],
+    ]);
+    expect(JSON.parse(requestBody(calls[0]?.init?.body))).toEqual({ goods_items_limit: 6, source: "history" });
+    expect(JSON.parse(requestBody(calls[1]?.init?.body))).toEqual({ order_nrs: ["12345"], goods_items_limit: 6 });
+    expect(JSON.parse(requestBody(calls[2]?.init?.body))).toEqual({ order_nr: "12345", update_payload: { cursor: "opaque" } });
+    expect(calls[3]?.url.searchParams.get("order_nr")).toBe("12345");
+    expect(new Headers(calls[3]?.init?.headers).get("authorization")).toBe("Bearer web-api-value");
+  });
+
   it("allows an adult menu item to be added to the cart", async () => {
     const directory = await temporaryDirectory();
     const cookieFile = join(directory, "cookie");
@@ -263,4 +300,8 @@ function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
 function requestUrl(input: string | URL | Request): URL {
   if (input instanceof Request) return new URL(input.url);
   return new URL(input.toString());
+}
+
+function requestBody(body: unknown): string {
+  return typeof body === "string" ? body : "null";
 }

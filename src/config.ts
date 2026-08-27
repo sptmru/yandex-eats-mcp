@@ -36,6 +36,15 @@ const envSchema = z
     YANDEX_EATS_ENABLE_MUTATIONS: booleanString.default(false),
     YANDEX_EATS_MAX_SEARCH_PLACES: z.coerce.number().int().min(1).max(50).default(10),
     YANDEX_EATS_MAX_ITEMS_PER_PLACE: z.coerce.number().int().min(1).max(25).default(5),
+    YANDEX_EATS_ENABLE_ORDER_MONITORING: booleanString.default(false),
+    YANDEX_EATS_ORDER_POLL_MIN_MS: z.coerce.number().int().min(1_000).max(60_000).default(2_000),
+    YANDEX_EATS_ORDER_POLL_MAX_MS: z.coerce.number().int().min(2_000).max(300_000).default(60_000),
+    YANDEX_EATS_ORDER_ERROR_BACKOFF_MAX_MS: z.coerce.number().int().min(10_000).max(600_000).default(120_000),
+    YANDEX_EATS_ORDER_EVENT_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+    YANDEX_EATS_ORDER_EVENT_MAX_COUNT: z.coerce.number().int().min(10).max(100_000).default(1_000),
+    ORDER_NOTIFY_PROVIDER: z.enum(["none", "telegram"]).default("none"),
+    ORDER_NOTIFY_TELEGRAM_TOKEN_FILE: z.string().default("/run/secrets/order_notify_telegram_token"),
+    ORDER_NOTIFY_TELEGRAM_CHAT_ID_FILE: z.string().default("/run/secrets/order_notify_telegram_chat_id"),
   })
   .superRefine((env, context) => {
     if ((env.YANDEX_EATS_LATITUDE === undefined) !== (env.YANDEX_EATS_LONGITUDE === undefined)) {
@@ -58,6 +67,14 @@ const envSchema = z
         code: "custom",
         path: ["MCP_AUTH_MODE"],
         message: "MCP_AUTH_MODE=none is forbidden in production",
+      });
+    }
+
+    if (env.YANDEX_EATS_ORDER_POLL_MIN_MS > env.YANDEX_EATS_ORDER_POLL_MAX_MS) {
+      context.addIssue({
+        code: "custom",
+        path: ["YANDEX_EATS_ORDER_POLL_MIN_MS"],
+        message: "YANDEX_EATS_ORDER_POLL_MIN_MS must not exceed YANDEX_EATS_ORDER_POLL_MAX_MS",
       });
     }
   });
@@ -92,6 +109,19 @@ export type AppConfig = {
     maxSearchPlaces: number;
     maxItemsPerPlace: number;
   };
+  orders: {
+    enabled: boolean;
+    pollMinMs: number;
+    pollMaxMs: number;
+    errorBackoffMaxMs: number;
+    eventRetentionDays: number;
+    eventMaxCount: number;
+    notifier: {
+      provider: "none" | "telegram";
+      telegramTokenFile: string;
+      telegramChatIdFile: string;
+    };
+  };
 };
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -123,6 +153,19 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       mutationsEnabled: parsed.YANDEX_EATS_ENABLE_MUTATIONS,
       maxSearchPlaces: parsed.YANDEX_EATS_MAX_SEARCH_PLACES,
       maxItemsPerPlace: parsed.YANDEX_EATS_MAX_ITEMS_PER_PLACE,
+    },
+    orders: {
+      enabled: parsed.YANDEX_EATS_ENABLE_ORDER_MONITORING,
+      pollMinMs: parsed.YANDEX_EATS_ORDER_POLL_MIN_MS,
+      pollMaxMs: parsed.YANDEX_EATS_ORDER_POLL_MAX_MS,
+      errorBackoffMaxMs: parsed.YANDEX_EATS_ORDER_ERROR_BACKOFF_MAX_MS,
+      eventRetentionDays: parsed.YANDEX_EATS_ORDER_EVENT_RETENTION_DAYS,
+      eventMaxCount: parsed.YANDEX_EATS_ORDER_EVENT_MAX_COUNT,
+      notifier: {
+        provider: parsed.ORDER_NOTIFY_PROVIDER,
+        telegramTokenFile: resolve(parsed.ORDER_NOTIFY_TELEGRAM_TOKEN_FILE),
+        telegramChatIdFile: resolve(parsed.ORDER_NOTIFY_TELEGRAM_CHAT_ID_FILE),
+      },
     },
   };
 }

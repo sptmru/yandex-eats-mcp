@@ -17,6 +17,14 @@ import type {
   NormalizedSearch,
 } from "./schemas.js";
 import { EatsSession } from "./session.js";
+import {
+  rawOrderDetailsEnvelopeSchema,
+  rawOrdersEnvelopeSchema,
+  rawTrackingEnvelopeSchema,
+  type RawOrderDetailsEnvelope,
+  type RawOrdersEnvelope,
+  type RawTrackingEnvelope,
+} from "../orders/upstream.js";
 
 type FetchLike = typeof fetch;
 type QueryValue = string | number | boolean | undefined | null;
@@ -166,6 +174,44 @@ export class YandexEatsClient {
       readLike: true,
     });
     return mapCartResponse(raw);
+  }
+
+  async listOrders(source?: string): Promise<RawOrdersEnvelope> {
+    const raw = await this.request("POST", ENDPOINTS.orders, {
+      authenticated: true,
+      readLike: true,
+      body: {
+        goods_items_limit: 6,
+        ...(source ? { source } : {}),
+      },
+    });
+    return rawOrdersEnvelopeSchema.parse(raw);
+  }
+
+  async refreshOrders(orderNrs: string[]): Promise<RawOrdersEnvelope> {
+    const raw = await this.request("POST", ENDPOINTS.refreshOrders, {
+      authenticated: true,
+      readLike: true,
+      body: { order_nrs: orderNrs, goods_items_limit: 6 },
+    });
+    return rawOrdersEnvelopeSchema.parse(raw);
+  }
+
+  async getOrderDetails(orderNr: string, updatePayload?: unknown): Promise<RawOrderDetailsEnvelope> {
+    const raw = await this.request("POST", ENDPOINTS.orderDetails, {
+      authenticated: true,
+      readLike: true,
+      body: { order_nr: orderNr, update_payload: updatePayload ?? null },
+    });
+    return rawOrderDetailsEnvelopeSchema.parse(raw);
+  }
+
+  async getDesktopTracking(orderNr: string): Promise<RawTrackingEnvelope> {
+    const raw = await this.request("GET", ENDPOINTS.desktopTracking, {
+      authenticated: true,
+      query: { order_nr: orderNr },
+    });
+    return rawTrackingEnvelopeSchema.parse(raw);
   }
 
   async addItems(input: {

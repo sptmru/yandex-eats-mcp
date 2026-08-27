@@ -12,6 +12,8 @@ import {
   normalizedSearchSchema,
 } from "../eats/schemas.js";
 import { toPublicError } from "./errors.js";
+import { createInactiveOrderMonitorService, type OrderMonitorService } from "../orders/order-monitor.js";
+import { normalizedOrderStatusSchema, orderEventSchema } from "../orders/types.js";
 
 const errorSchema = {
   code: z.string(),
@@ -37,12 +39,13 @@ export function createYandexEatsMcpServer(
   client: YandexEatsClient,
   config: AppConfig,
   logger: Logger,
+  orderMonitor: OrderMonitorService = createInactiveOrderMonitorService(config),
 ): McpServer {
   const server = new McpServer(
     { name: "yandex-eats-mcp", version: "0.1.0" },
     {
       instructions:
-        "Search and read tools may run automatically. Cart mutations require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Items marked adult may be added to the cart; any eligibility or age-verification requirements remain enforced by Yandex Eats. Pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
+        "Search, order monitoring, and other read tools may run automatically. To consume order changes, call get_order_events with the last nextSequence cursor; the MCP cannot initiate a message in a sleeping ChatGPT conversation. Cart mutations require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Items marked adult may be added to the cart; any eligibility or age-verification requirements remain enforced by Yandex Eats. Pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
     },
   );
 
@@ -180,6 +183,77 @@ export function createYandexEatsMcpServer(
   );
 
   server.registerTool(
+    "get_active_orders",
+    {
+      title: "Get active Yandex Eats orders",
+      description: "Return sanitized cached active-order statuses and order-monitor health. No address, coordinates, phone, payment, map, or courier identity is exposed.",
+      inputSchema: {},
+      outputSchema: {
+        monitorEnabled: z.boolean(),
+        monitorHealthy: z.boolean(),
+        authExpired: z.boolean(),
+        lastSuccessfulPollAt: z.string().optional(),
+        orders: z.array(normalizedOrderStatusSchema),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    () => toolCall(logger, "get_active_orders", () => Promise.resolve(orderMonitor.getHealth()), (value) =>
+      `Order monitor returned ${value.orders.length} active orders.`,
+    ),
+  );
+
+  server.registerTool(
+    "get_order_status",
+    {
+      title: "Get one Yandex Eats order status",
+      description: "Return a sanitized cached status for one order. Set refresh=true to perform an immediate read-only tracking request.",
+      inputSchema: {
+        orderNr: z.union([z.string(), z.number()]).transform(String),
+        refresh: z.boolean().default(false),
+      },
+      outputSchema: {
+        found: z.boolean(),
+        status: normalizedOrderStatusSchema.optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    ({ orderNr, refresh }) => toolCall(
+      logger,
+      "get_order_status",
+      async () => {
+        const status = await orderMonitor.getOrderStatus(orderNr, refresh);
+        return { found: status !== undefined, ...(status ? { status } : {}) };
+      },
+      (value) => value.found ? "Order status loaded." : "Order status is not cached.",
+    ),
+  );
+
+  server.registerTool(
+    "get_order_events",
+    {
+      title: "Get Yandex Eats order events",
+      description: "Read order changes from the persistent journal using an exclusive sequence cursor. Readers do not acknowledge or consume events for other clients.",
+      inputSchema: {
+        afterSequence: z.number().int().nonnegative().optional(),
+        limit: z.number().int().min(1).max(200).default(50),
+        orderNr: z.union([z.string(), z.number()]).transform(String).optional(),
+      },
+      outputSchema: {
+        events: z.array(orderEventSchema),
+        nextSequence: z.number().int().nonnegative(),
+        hasMore: z.boolean(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    (input) => toolCall(
+      logger,
+      "get_order_events",
+      () => Promise.resolve(orderMonitor.getEvents(compactOptional(input))),
+      (value) => `Loaded ${value.events.length} order events; next sequence is ${value.nextSequence}.`,
+    ),
+  );
+
+  server.registerTool(
     "add_to_cart",
     {
       title: "Add items to Yandex Eats cart",
@@ -285,6 +359,10 @@ export function createYandexEatsMcpServer(
         supportedShippingTypes: z.array(z.literal("delivery")),
         supportedBusinesses: z.array(z.literal("restaurant")),
         adultItemsSupported: z.literal(true),
+        orderMonitoringEnabled: z.boolean(),
+        orderEventJournalEnabled: z.literal(true),
+        orderNotifier: z.enum(["none", "telegram"]),
+        chatgptDirectPushSupported: z.literal(false),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -299,6 +377,10 @@ export function createYandexEatsMcpServer(
           supportedShippingTypes: ["delivery" as const],
           supportedBusinesses: ["restaurant" as const],
           adultItemsSupported: true as const,
+          orderMonitoringEnabled: config.orders.enabled,
+          orderEventJournalEnabled: true as const,
+          orderNotifier: orderMonitor.getNotifierProvider(),
+          chatgptDirectPushSupported: false as const,
         }),
         (value) => `Cart mutations are ${value.cartMutationsEnabled ? "enabled" : "disabled"}; checkout is disabled.`,
       ),

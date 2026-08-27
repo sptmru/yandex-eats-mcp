@@ -45,6 +45,9 @@ describe("MCP contract", () => {
         "get_place",
         "get_menu",
         "get_cart",
+        "get_active_orders",
+        "get_order_status",
+        "get_order_events",
         "add_to_cart",
         "update_cart_item",
         "remove_cart_item",
@@ -61,7 +64,13 @@ describe("MCP contract", () => {
         checkoutEnabled: false,
         placeOrderEnabled: false,
         adultItemsSupported: true,
+        orderMonitoringEnabled: false,
+        orderEventJournalEnabled: true,
+        orderNotifier: "none",
+        chatgptDirectPushSupported: false,
       });
+      const events = listed.tools.find((tool) => tool.name === "get_order_events");
+      expect(events?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
     } finally {
       await mcpClient.close();
       await server.close();

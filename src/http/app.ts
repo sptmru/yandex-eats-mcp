@@ -12,11 +12,13 @@ import { readSecretFile, type AppConfig } from "../config.js";
 import type { YandexEatsClient } from "../eats/client.js";
 import { createYandexEatsMcpServer } from "../mcp/server.js";
 import { SingleUserOAuthProvider, StaticBearerVerifier } from "../auth/single-user-oauth.js";
+import { createInactiveOrderMonitorService, type OrderMonitorService } from "../orders/order-monitor.js";
 
 export async function createHttpApp(
   config: AppConfig,
   client: YandexEatsClient,
   logger: Logger,
+  orderMonitor: OrderMonitorService = createInactiveOrderMonitorService(config),
 ): Promise<Express> {
   const allowedHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
   if (config.publicBaseUrl) allowedHosts.add(config.publicBaseUrl.hostname);
@@ -59,7 +61,14 @@ export async function createHttpApp(
     res.status(200).json({ status: "ok" });
   });
   app.get("/readyz", (_req, res) => {
-    res.status(200).json({ status: "ready" });
+    const health = orderMonitor.getHealth();
+    res.status(200).json({
+      status: "ready",
+      monitorEnabled: health.monitorEnabled,
+      monitorHealthy: health.monitorHealthy,
+      authExpired: health.authExpired,
+      ...(health.lastSuccessfulPollAt ? { lastSuccessfulPollAt: health.lastSuccessfulPollAt } : {}),
+    });
   });
   app.get("/", (_req, res) => {
     res.status(200).json({
@@ -72,7 +81,7 @@ export async function createHttpApp(
   });
 
   app.post("/mcp", authMiddleware, async (req, res) => {
-    const server = createYandexEatsMcpServer(client, config, logger);
+    const server = createYandexEatsMcpServer(client, config, logger, orderMonitor);
     const transport = new StreamableHTTPServerTransport();
     try {
       await server.connect(transport as unknown as Transport);

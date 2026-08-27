@@ -34,11 +34,22 @@ services:
       YANDEX_EATS_ENABLE_MUTATIONS: ${YANDEX_EATS_ENABLE_MUTATIONS:-false}
       YANDEX_EATS_MAX_SEARCH_PLACES: ${YANDEX_EATS_MAX_SEARCH_PLACES:-10}
       YANDEX_EATS_MAX_ITEMS_PER_PLACE: ${YANDEX_EATS_MAX_ITEMS_PER_PLACE:-5}
+      YANDEX_EATS_ENABLE_ORDER_MONITORING: ${YANDEX_EATS_ENABLE_ORDER_MONITORING:-false}
+      YANDEX_EATS_ORDER_POLL_MIN_MS: ${YANDEX_EATS_ORDER_POLL_MIN_MS:-2000}
+      YANDEX_EATS_ORDER_POLL_MAX_MS: ${YANDEX_EATS_ORDER_POLL_MAX_MS:-60000}
+      YANDEX_EATS_ORDER_ERROR_BACKOFF_MAX_MS: ${YANDEX_EATS_ORDER_ERROR_BACKOFF_MAX_MS:-120000}
+      YANDEX_EATS_ORDER_EVENT_RETENTION_DAYS: ${YANDEX_EATS_ORDER_EVENT_RETENTION_DAYS:-30}
+      YANDEX_EATS_ORDER_EVENT_MAX_COUNT: ${YANDEX_EATS_ORDER_EVENT_MAX_COUNT:-1000}
+      ORDER_NOTIFY_PROVIDER: ${ORDER_NOTIFY_PROVIDER:-none}
+      ORDER_NOTIFY_TELEGRAM_TOKEN_FILE: /run/secrets/order_notify_telegram_token
+      ORDER_NOTIFY_TELEGRAM_CHAT_ID_FILE: /run/secrets/order_notify_telegram_chat_id
     volumes:
       - yandex-eats-state:/app/state
     secrets:
       - yandex_eats_cookie
       - mcp_oauth_password
+      - order_notify_telegram_token
+      - order_notify_telegram_chat_id
     tmpfs:
       - /tmp:size=16m,mode=1777
     security_opt:
@@ -67,3 +78,7 @@ secrets:
     file: ${YANDEX_EATS_COOKIE_SECRET_FILE:-./secrets/yandex_eats_cookie}
   mcp_oauth_password:
     file: ${MCP_OAUTH_PASSWORD_SECRET_FILE:-./secrets/mcp_oauth_password}
+  order_notify_telegram_token:
+    file: ${ORDER_NOTIFY_TELEGRAM_TOKEN_SECRET_FILE:-./secrets/order_notify_telegram_token}
+  order_notify_telegram_chat_id:
+    file: ${ORDER_NOTIFY_TELEGRAM_CHAT_ID_SECRET_FILE:-./secrets/order_notify_telegram_chat_id}

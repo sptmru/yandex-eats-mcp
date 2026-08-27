@@ -16,6 +16,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:live:readonly": "RUN_LIVE_EATS_TESTS=true vitest run tests/live/read-only.test.ts",
+    "test:live:orders:readonly": "RUN_LIVE_EATS_ORDER_TESTS=true vitest run tests/live/orders-readonly.test.ts",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {

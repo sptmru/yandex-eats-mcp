@@ -5,8 +5,11 @@ export const ENDPOINTS = {
   menu: (placeSlug: string) => `/api/v2/menu/retrieve/${encodeURIComponent(placeSlug)}`,
   multiCarts: "/eats/v1/cart/v2/multi-carts",
   fullCarts: "/eats/v1/cart/v2/full-carts",
+  orders: "/eats/v1/orders-info/v1/orders",
+  refreshOrders: "/eats/v1/orders-info/v1/refresh-orders",
+  orderDetails: "/eats/v1/orders-info/v1/desktop/order-details",
+  desktopTracking: "/eats/v1/eats-orders-tracking/v1/tracking-for-desktop",
   addCartItem: "/api/v1/cart",
   addCartItemsBulk: "/api/v1/cart/add_bulk",
   cartItem: (cartItemId: string) => `/api/v1/cart/${encodeURIComponent(cartItemId)}`,
 } as const;
-
