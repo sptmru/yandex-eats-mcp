@@ -30,9 +30,9 @@ export class TelegramOrderNotifier implements OrderNotifier {
 export function formatTelegramEvent(event: OrderEvent): string {
   const masked = event.orderNr ? maskOrderNumber(event.orderNr) : undefined;
   const heading = event.type.startsWith("monitor.") ? "Yandex Eats monitor" : `Yandex Eats order ${masked ?? ""}`.trim();
-  const etaText = event.current?.etaText ?? (event.type === "order.eta_changed" ? event.current?.title : undefined);
-  const eta = etaText ? `\nETA: ${etaText}` : "";
-  return `${heading}\n${event.summary}${eta}`;
+  const waitText = event.current?.terminal ? undefined : event.current?.etaText ?? event.current?.title;
+  const wait = waitText ? `\nОжидание: ${waitText}` : "";
+  return `${heading}\n${event.summary}${wait}`;
 }
 
 function maskOrderNumber(orderNr: string): string {

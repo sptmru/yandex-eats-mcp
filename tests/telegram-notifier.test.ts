@@ -18,6 +18,7 @@ describe("TelegramOrderNotifier", () => {
     const body = JSON.parse(requestBody(calls[0]?.init?.body)) as { chat_id: string; text: string };
     expect(body.chat_id).toBe("12345");
     expect(body.text).toContain("***6789");
+    expect(body.text).toContain("Ожидание: 20 min");
     expect(body.text).not.toContain("123456789");
     expect(body.text).not.toContain("courier-name");
   });
@@ -30,6 +31,21 @@ describe("TelegramOrderNotifier", () => {
       type: "monitor.recovered",
       summary: "Recovered.",
     })).toBe("Yandex Eats monitor\nRecovered.");
+  });
+
+  it("includes current waiting time in status events and the new value in ETA events", () => {
+    const statusEvent = sampleEvent();
+    statusEvent.current = {
+      ...statusEvent.current!,
+      title: "Ещё 20–25 минут",
+      subtitle: "Курьер уже спешит к вам",
+      etaText: undefined,
+    };
+    expect(formatTelegramEvent(statusEvent)).toContain("Ожидание: Ещё 20–25 минут");
+
+    const etaEvent = { ...statusEvent, type: "order.eta_changed" as const };
+    etaEvent.current = { ...statusEvent.current, title: "Ещё 15–20 минут" };
+    expect(formatTelegramEvent(etaEvent)).toContain("Ожидание: Ещё 15–20 минут");
   });
 });
 
