@@ -95,7 +95,9 @@ describe("mapSearchResponse", () => {
       ],
     };
 
-    expect(mapSearchResponse(raw, "query", 10, 5, true).places).toEqual([
+    const result = mapSearchResponse(raw, "query", 10, 5, true);
+    expect(result.currency).toBe("AMD");
+    expect(result.places).toEqual([
       {
         placeSlug: "closed",
         name: "Closed",
@@ -236,6 +238,7 @@ describe("mapMenuResponse", () => {
   });
 
   it("uses the fallback currency and rejects responses without categories", () => {
+    expect(mapMenuResponse({ payload: { categories: [] } }, "cafe").currency).toBe("AMD");
     expect(mapMenuResponse({ payload: { categories: [] } }, "cafe", "USD")).toEqual({
       placeSlug: "cafe",
       currency: "USD",

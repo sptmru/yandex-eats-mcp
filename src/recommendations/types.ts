@@ -12,6 +12,19 @@ export const normalizedDishSchema = z.object({
   heaviness: z.number().min(0).max(1),
 });
 
+export const intentMatchSchema = z.object({
+  intent: z.string(),
+  matchedTerms: z.array(z.string()),
+  intentCoverage: z.number().min(0).max(1),
+  matchedIntent: z.boolean(),
+});
+
+export const recommendationIntentGroupSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  alternatives: z.array(z.array(z.string())),
+});
+
 export const foodResultSchema = z.object({
   placeSlug: z.string(),
   placeName: z.string(),
@@ -32,6 +45,10 @@ export const foodResultSchema = z.object({
   hasRequiredOptions: z.boolean(),
   menuCategories: z.array(z.string()),
   normalized: normalizedDishSchema,
+  matchedTerms: z.array(z.string()),
+  intentCoverage: z.number().min(0).max(1),
+  matchedIntent: z.boolean(),
+  intentMatches: z.array(intentMatchSchema),
   matchedIntents: z.array(z.string()),
   score: z.number().min(0).max(1),
   scoreReasons: z.array(z.string()),
@@ -48,6 +65,15 @@ export const foodSearchResultSchema = z.object({
 export const recommendationResultSchema = z.object({
   query: z.string(),
   searchIntents: z.array(z.string()),
+  intentGroups: z.array(recommendationIntentGroupSchema),
+  sameRestaurant: z.boolean(),
+  restaurantCoverage: z.object({
+    placeSlug: z.string(),
+    placeName: z.string(),
+    matchedGroups: z.number().int().nonnegative(),
+    totalGroups: z.number().int().positive(),
+    coverage: z.number().min(0).max(1),
+  }).optional(),
   candidatePlaces: z.number().int().nonnegative(),
   menusLoaded: z.number().int().nonnegative(),
   results: z.array(foodResultSchema),
@@ -71,6 +97,8 @@ export const foodPreferencesResultSchema = z.object({
 });
 
 export type NormalizedDish = z.infer<typeof normalizedDishSchema>;
+export type IntentMatch = z.infer<typeof intentMatchSchema>;
+export type RecommendationIntentGroup = z.infer<typeof recommendationIntentGroupSchema>;
 export type FoodResult = z.infer<typeof foodResultSchema>;
 export type FoodSearchResult = z.infer<typeof foodSearchResultSchema>;
 export type RecommendationResult = z.infer<typeof recommendationResultSchema>;
@@ -90,6 +118,7 @@ export type RecommendFoodInput = {
   maxPerRestaurant?: number | undefined;
   maxPerCategory?: number | undefined;
   exploration?: number | undefined;
+  sameRestaurant?: boolean | undefined;
   limit?: number | undefined;
 };
 

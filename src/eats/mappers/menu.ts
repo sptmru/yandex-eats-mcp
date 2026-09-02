@@ -2,14 +2,15 @@ import { EatsError } from "../../mcp/errors.js";
 import type { NormalizedMenu, NormalizedMenuCategory, NormalizedMenuItem } from "../schemas.js";
 import { asArray, asBoolean, asNumber, asRecord, asString, firstDefined } from "./common.js";
 
-export function mapMenuResponse(raw: unknown, placeSlug: string, fallbackCurrency = "UNKNOWN"): NormalizedMenu {
+export function mapMenuResponse(raw: unknown, placeSlug: string, fallbackCurrency = "AMD"): NormalizedMenu {
   const root = asRecord(raw);
   const payload = asRecord(root?.payload);
   if (!payload || !Array.isArray(payload.categories)) {
     throw new EatsError("UPSTREAM_BAD_RESPONSE", "Menu returned an invalid response.");
   }
   const currencyRecord = asRecord(payload.currency);
-  const currency = asString(firstDefined(currencyRecord, ["code", "sign"])) ?? fallbackCurrency;
+  const rawCurrency = asString(firstDefined(currencyRecord, ["code", "sign"]));
+  const currency = rawCurrency === "֏" ? "AMD" : rawCurrency ?? fallbackCurrency;
   return {
     placeSlug,
     currency,
@@ -93,4 +94,3 @@ function mapItem(value: unknown, currency: string): NormalizedMenuItem | undefin
       .filter((group): group is NonNullable<typeof group> => group !== undefined),
   };
 }
-

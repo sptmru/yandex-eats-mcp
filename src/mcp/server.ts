@@ -166,7 +166,7 @@ export function createYandexEatsMcpServer(
     {
       title: "Recommend Yandex Eats dishes",
       description:
-        "Recommend current menu items for a natural-language request using deterministic multilingual normalization, preference/price/heaviness scoring, and diversity-aware selection.",
+        "Recommend current menu items for a natural-language request using deterministic multilingual normalization, constraint coverage, preference/price/heaviness scoring, and intent-group restaurant selection.",
       inputSchema: {
         query: z.string().trim().min(1).max(500),
         categories: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
@@ -177,6 +177,7 @@ export function createYandexEatsMcpServer(
         maxPerRestaurant: z.number().int().min(1).max(10).default(2),
         maxPerCategory: z.number().int().min(1).max(10).default(2),
         exploration: z.number().min(0).max(1).default(0.35),
+        sameRestaurant: z.boolean().optional(),
         limit: z.number().int().min(1).max(30).default(10),
       },
       outputSchema: recommendationResultSchema.shape,

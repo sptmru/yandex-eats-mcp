@@ -23,8 +23,8 @@ export function mapSearchResponse(
   }
 
   const currencyRecord = asRecord(root.currency);
-  const currency =
-    asString(firstDefined(currencyRecord, ["code", "sign", "text"])) ?? "UNKNOWN";
+  const rawCurrency = asString(firstDefined(currencyRecord, ["code", "sign", "text"]));
+  const currency = rawCurrency === "֏" ? "AMD" : rawCurrency ?? "AMD";
   const pagination = asRecord(root.pagination);
   const cursor = asString(pagination?.context);
   const places: NormalizedSearch["places"] = [];

@@ -2,7 +2,12 @@ import type { Logger } from "pino";
 import type { YandexEatsClient } from "../eats/client.js";
 import type { NormalizedMenu, NormalizedMenuCategory, NormalizedSearch } from "../eats/schemas.js";
 import { diversifyResults } from "./diversify.js";
-import { expandSearchIntents } from "./intents.js";
+import {
+  evaluateIntent,
+  evaluateIntentGroup,
+  expandSearchIntents,
+  parseRecommendationIntentGroups,
+} from "./intents.js";
 import { normalizeDish, normalizeText } from "./normalize.js";
 import { calculateRelevance, scoreCandidate } from "./scoring.js";
 import type {
@@ -10,6 +15,7 @@ import type {
   FoodResult,
   FoodSearchResult,
   RecommendFoodInput,
+  RecommendationIntentGroup,
   RecommendationResult,
   SearchItemsInput,
 } from "./types.js";
@@ -67,7 +73,7 @@ export class RecommendationService {
         ...stripRelevance(candidate),
         score: round(candidate.relevance * 0.85 + ratingSignal(candidate.rating) * 0.15),
         scoreReasons: [
-          candidate.relevance >= 0.65 ? "strong item match" : "relevant menu match",
+          candidate.matchedIntent ? "full intent match" : `partial intent match (${candidate.intentCoverage})`,
           ...(candidate.rating !== undefined ? [`restaurant rating ${candidate.rating}`] : []),
         ],
       }))
@@ -83,6 +89,8 @@ export class RecommendationService {
   }
 
   async recommend(input: RecommendFoodInput): Promise<RecommendationResult> {
+    const parsedIntent = parseRecommendationIntentGroups(input.query);
+    const sameRestaurant = input.sameRestaurant ?? parsedIntent.sameRestaurant;
     const searchIntents = expandSearchIntents({
       query: input.query,
       ...(input.categories ? { categories: input.categories } : {}),
@@ -96,20 +104,28 @@ export class RecommendationService {
     });
     const preferences = await this.preferences.list();
     const scored = gathered.candidates
+      .map((candidate) => applyIntentGroups(candidate, parsedIntent.groups))
       .map((candidate) => scoreCandidate(candidate, input, preferences))
       .filter((candidate): candidate is FoodResult => candidate !== undefined)
       .sort((a, b) => b.score - a.score);
     const limit = input.limit ?? 10;
-    const results = diversifyResults(deduplicateResults(scored), {
-      limit,
-      maxPerRestaurant: input.maxPerRestaurant ?? 2,
-      maxPerCategory: input.maxPerCategory ?? 2,
-      exploration: input.exploration ?? 0.35,
-    });
+    const deduplicated = deduplicateResults(scored);
+    const grouped = sameRestaurant && parsedIntent.groups.length > 1
+      ? selectSameRestaurantResults(deduplicated, parsedIntent.groups, limit)
+      : undefined;
+    const results = grouped?.results ?? diversifyResults(deduplicated, {
+        limit,
+        maxPerRestaurant: input.maxPerRestaurant ?? 2,
+        maxPerCategory: input.maxPerCategory ?? 2,
+        exploration: input.exploration ?? 0.35,
+      });
 
     return {
       query: input.query,
       searchIntents,
+      intentGroups: parsedIntent.groups,
+      sameRestaurant,
+      ...(grouped?.restaurantCoverage ? { restaurantCoverage: grouped.restaurantCoverage } : {}),
       candidatePlaces: gathered.candidatePlaces,
       menusLoaded: gathered.menusLoaded,
       results,
@@ -174,20 +190,25 @@ export class RecommendationService {
           menuCategories: item.menuCategories,
           ...(item.weight ? { weight: item.weight } : {}),
         });
-        const intentScores = input.queries.map((query) => ({
-          query,
-          relevance: searchEvidence?.queries.has(query)
-            ? 0.95
-            : calculateRelevance({
+        const text = [item.name, searchName, item.description, ...item.menuCategories].filter(Boolean).join(" ");
+        const intentScores = input.queries.map((query) => {
+          const match = evaluateIntent(query, normalized, text);
+          const lexicalRelevance = calculateRelevance({
             name: [item.name, searchName].filter(Boolean).join(" "),
             ...(item.description ? { description: item.description } : {}),
             menuCategories: item.menuCategories,
             query,
             normalized,
-          }),
-        }));
-        const matchedIntents = intentScores.filter((entry) => entry.relevance >= 0.2).map((entry) => entry.query);
-        if (matchedIntents.length === 0) continue;
+          });
+          const evidenceRelevance = searchEvidence?.queries.has(query)
+            ? 0.1 + match.intentCoverage * 0.85
+            : 0;
+          return { ...match, relevance: Math.max(lexicalRelevance, evidenceRelevance) };
+        });
+        const matchedIntents = intentScores.filter((entry) => entry.matchedIntent).map((entry) => entry.intent);
+        const intentCoverage = Math.max(...intentScores.map((entry) => entry.intentCoverage));
+        const matchedTerms = unique(intentScores.flatMap((entry) => entry.matchedTerms));
+        if (intentCoverage === 0) continue;
         const relevance = Math.max(...intentScores.map((entry) => entry.relevance));
         const rating = parseRating(result.place.rating);
         candidates.push({
@@ -210,6 +231,13 @@ export class RecommendationService {
           hasRequiredOptions: item.optionGroups.some((group) => group.required || group.minSelected > 0),
           menuCategories: item.menuCategories,
           normalized,
+          matchedTerms,
+          intentCoverage,
+          matchedIntent: matchedIntents.length > 0,
+          intentMatches: intentScores.map(({ relevance: _relevance, ...match }) => {
+            void _relevance;
+            return match;
+          }),
           matchedIntents,
           relevance,
         });
@@ -366,6 +394,94 @@ function deduplicateResults(results: FoodResult[]): FoodResult[] {
   });
 }
 
+function selectSameRestaurantResults(
+  candidates: FoodResult[],
+  groups: RecommendationIntentGroup[],
+  limit: number,
+): {
+  results: FoodResult[];
+  restaurantCoverage: {
+    placeSlug: string;
+    placeName: string;
+    matchedGroups: number;
+    totalGroups: number;
+    coverage: number;
+  };
+} | undefined {
+  const byRestaurant = new Map<string, FoodResult[]>();
+  for (const candidate of candidates) {
+    const previous = byRestaurant.get(candidate.placeSlug) ?? [];
+    previous.push(candidate);
+    byRestaurant.set(candidate.placeSlug, previous);
+  }
+
+  const ranked = [...byRestaurant.entries()].map(([placeSlug, restaurantCandidates]) => {
+    const options = groups.map((group, groupIndex) => ({
+      groupIndex,
+      candidates: restaurantCandidates
+        .map((candidate) => ({
+          candidate,
+          match: evaluateIntentGroup(group, candidate.normalized, candidateText(candidate)),
+        }))
+        .filter((entry) => entry.match.matchedIntent)
+        .sort((left, right) => right.candidate.score - left.candidate.score),
+    })).sort((left, right) => left.candidates.length - right.candidates.length);
+    const used = new Set<string>();
+    const selected: Array<{ groupIndex: number; candidate: FoodResult }> = [];
+    for (const option of options) {
+      const match = option.candidates.find((entry) => !used.has(entry.candidate.itemId));
+      if (!match) continue;
+      used.add(match.candidate.itemId);
+      selected.push({ groupIndex: option.groupIndex, candidate: match.candidate });
+    }
+    selected.sort((left, right) => left.groupIndex - right.groupIndex);
+    return {
+      placeSlug,
+      placeName: restaurantCandidates[0]?.placeName ?? placeSlug,
+      selected: selected.map((entry) => entry.candidate),
+      matchedGroups: selected.length,
+      score: selected.reduce((total, entry) => total + entry.candidate.score, 0),
+    };
+  }).sort((left, right) =>
+    right.matchedGroups - left.matchedGroups || right.score - left.score || left.placeName.localeCompare(right.placeName)
+  );
+
+  const best = ranked[0];
+  if (!best || best.matchedGroups === 0) return undefined;
+  return {
+    results: best.selected.slice(0, limit),
+    restaurantCoverage: {
+      placeSlug: best.placeSlug,
+      placeName: best.placeName,
+      matchedGroups: best.matchedGroups,
+      totalGroups: groups.length,
+      coverage: round(best.matchedGroups / groups.length),
+    },
+  };
+}
+
+function applyIntentGroups(candidate: DishCandidate, groups: RecommendationIntentGroup[]): DishCandidate {
+  if (groups.length === 0) return candidate;
+  const matches = groups.map((group) =>
+    evaluateIntentGroup(group, candidate.normalized, candidateText(candidate))
+  );
+  const matchedIntents = matches.filter((match) => match.matchedIntent).map((match) => match.intent);
+  return {
+    ...candidate,
+    matchedTerms: unique(matches.flatMap((match) => match.matchedTerms)),
+    intentCoverage: Math.max(...matches.map((match) => match.intentCoverage)),
+    matchedIntent: matchedIntents.length > 0,
+    intentMatches: matches,
+    matchedIntents,
+  };
+}
+
+function candidateText(
+  candidate: Pick<FoodResult, "name" | "searchName" | "description" | "menuCategories">,
+): string {
+  return [candidate.name, candidate.searchName, candidate.description, ...candidate.menuCategories].filter(Boolean).join(" ");
+}
+
 function uniqueQueries(queries: string[]): string[] {
   const seen = new Set<string>();
   return queries.map((query) => query.trim()).filter((query) => {
@@ -374,6 +490,10 @@ function uniqueQueries(queries: string[]): string[] {
     seen.add(normalized);
     return true;
   });
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
 }
 
 function parseRating(value?: string): number | undefined {

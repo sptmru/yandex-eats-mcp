@@ -1,4 +1,4 @@
-import { normalizeText, termMatchesDish, tokenize } from "./normalize.js";
+import { canonicalValues, normalizeText, termMatchesDish, tokenize } from "./normalize.js";
 import type { DishCandidate, FoodPreference, FoodResult, RecommendFoodInput } from "./types.js";
 
 export function scoreCandidate(
@@ -15,15 +15,15 @@ export function scoreCandidate(
   }
 
   const reasons: string[] = [];
-  let score = candidate.relevance * 0.42;
-  if (candidate.relevance >= 0.65) reasons.push("strong item match");
-  else if (candidate.relevance >= 0.35) reasons.push("relevant menu match");
+  let score = candidate.relevance * 0.22 + candidate.intentCoverage * 0.2;
+  if (candidate.matchedIntent) reasons.push("full intent match");
+  else if (candidate.intentCoverage > 0) reasons.push(`partial intent match (${candidate.intentCoverage})`);
 
   const ratingSignal = candidate.rating === undefined ? 0.55 : clamp((candidate.rating - 3.5) / 1.5);
   score += ratingSignal * 0.13;
   if (candidate.rating !== undefined && candidate.rating >= 4.6) reasons.push(`restaurant rating ${candidate.rating}`);
 
-  const preferred = (input.prefer ?? []).filter((term) => termMatchesDish(term, candidate.normalized, text));
+  const preferred = uniqueSemanticTerms(input.prefer ?? []).filter((term) => termMatchesDish(term, candidate.normalized, text));
   if (preferred.length > 0) {
     score += Math.min(0.18, preferred.length * 0.09);
     reasons.push(`preferred: ${preferred.slice(0, 3).join(", ")}`);
@@ -120,6 +120,17 @@ function stripRelevance(candidate: DishCandidate): Omit<DishCandidate, "relevanc
   const { relevance, ...result } = candidate;
   void relevance;
   return result;
+}
+
+function uniqueSemanticTerms(terms: string[]): string[] {
+  const seen = new Set<string>();
+  return terms.filter((term) => {
+    const canonical = canonicalValues(term);
+    const key = canonical.length > 0 ? [...canonical].sort().join("|") : normalizeText(term);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function clamp(value: number): number {
