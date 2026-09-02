@@ -20,7 +20,19 @@ const CATEGORY_RULES: Rule[] = [
   rule("bowl", "bowl", "боул"),
   rule("main", "main course", "steak", "стейк", "горячее", "основное блюдо"),
   rule("sandwich", "sandwich", "burger", "wrap", "шаурм", "бургер", "сэндвич", "ролл"),
-  rule("pasta", "pasta", "spaghetti", "паста", "спагетти"),
+  rule(
+    "pasta",
+    "pasta",
+    "spaghetti",
+    "tagliatelle",
+    "noodle",
+    "udon",
+    "паста",
+    "спагетти",
+    "тальятелле",
+    "лапш",
+    "удон",
+  ),
   rule("pizza", "pizza", "пицц"),
   rule("breakfast", "breakfast", "omelet", "omelette", "завтрак", "омлет", "сырник"),
   rule("dessert", "dessert", "cake", "brownie", "cheesecake", "десерт", "тортик", "брауни", "чизкейк"),
@@ -48,7 +60,31 @@ const PROTEIN_RULES: Rule[] = [
 const METHOD_RULES: Rule[] = [
   rule("grilled", "grill", "grilled", "charcoal", "грил", "на углях"),
   rule("steamed", "steam", "steamed", "на пару", "паровой"),
-  rule("fried", "fried", "deep-fried", "tempura", "crispy", "фри", "жарен", "темпур", "хрустящ"),
+  rule(
+    "fried",
+    "fried",
+    "deep-fried",
+    "tempura",
+    "crispy",
+    "batter",
+    "battered",
+    "breaded",
+    "breading",
+    "crumbed",
+    "фри",
+    "жарен",
+    "темпур",
+    "хрустящ",
+    "кляр",
+    "паниров",
+    "фритюр",
+    "տապակ",
+    "տեմպուր",
+    "խրթխրթան",
+    "ֆրիտյուր",
+    "պաքսիմատ",
+    "խմորապատ",
+  ),
   rule("baked", "baked", "roasted", "oven", "запеч", "печен", "из печи"),
   rule("raw", "raw", "sashimi", "tartare", "carpaccio", "сырой", "сашими", "тартар", "карпаччо"),
   rule("boiled", "boiled", "poached", "варен", "варён", "отварн", "пашот"),
@@ -69,6 +105,26 @@ const CUISINE_RULES: Rule[] = [
 const SPICY = patterns("spicy", "chili", "chilli", "jalapeno", "sriracha", "остр", "чили", "халапеньо", "шрирач");
 const CREAMY = patterns("cream", "creamy", "mayonnaise", "mayo", "cheese sauce", "сливоч", "майонез", "сырный соус");
 const VEGETARIAN = patterns("vegetarian", "vegan", "plant based", "вегетариан", "веган", "растительное");
+const VEGETARIAN_INGREDIENTS = patterns(
+  "vegetable",
+  "veggie",
+  "mushroom",
+  "avocado",
+  "tofu",
+  "lentil",
+  "chickpea",
+  "овощ",
+  "гриб",
+  "авокадо",
+  "тофу",
+  "чечевиц",
+  "нут",
+  "բանջարեղեն",
+  "սունկ",
+  "ավոկադո",
+  "տոֆու",
+  "ոսպ",
+);
 const HEAVY = patterns("double", "loaded", "cheesy", "bacon", "butter", "cream", "майонез", "бекон", "сливоч", "сырный", "двойной");
 const LIGHT = patterns("light", "fresh", "low calorie", "лёгк", "легк", "свеж", "диетическ");
 
@@ -110,8 +166,12 @@ export function normalizeDish(input: {
   const fried = cookingMethods.includes("fried");
   const creamy = matchesAny(text, CREAMY) || compounds.some((entry) => entry.creamy);
   const spicy = matchesAny(text, SPICY);
-  const hasAnimalProtein = proteins.some((protein) => !["tofu", "legumes"].includes(protein));
-  const vegetarian = matchesAny(text, VEGETARIAN) || (!hasAnimalProtein && categories.includes("salad"));
+  const hasAnimalProtein = proteins.some((protein) => !["tofu", "legumes"].includes(protein)) ||
+    categories.some((category) => ["fish", "seafood", "meat"].includes(category));
+  const hasVegetarianEvidence = matchesAny(text, VEGETARIAN) ||
+    matchesAny(text, VEGETARIAN_INGREDIENTS) ||
+    proteins.some((protein) => ["tofu", "legumes"].includes(protein));
+  const vegetarian = !hasAnimalProtein && hasVegetarianEvidence;
 
   let heaviness = 0.45;
   if (categories.includes("salad")) heaviness -= 0.2;

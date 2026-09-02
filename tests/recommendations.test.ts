@@ -11,7 +11,7 @@ import {
 } from "../src/recommendations/intents.js";
 import { normalizeDish } from "../src/recommendations/normalize.js";
 import { FoodPreferenceStore } from "../src/recommendations/preferences-store.js";
-import { scoreCandidate } from "../src/recommendations/scoring.js";
+import { scoreCandidate, scoreSearchCandidate } from "../src/recommendations/scoring.js";
 import { RecommendationService } from "../src/recommendations/service.js";
 import type { DishCandidate, FoodResult } from "../src/recommendations/types.js";
 import { createLogger } from "../src/logger.js";
@@ -88,22 +88,101 @@ describe("dish normalization", () => {
     },
   );
 
-  it("decomposes a compound intent and only marks full constraint coverage as matched", () => {
+  it("does not award secondary fish or light modifiers when the required salad concept is absent", () => {
     const trout = normalizeDish({ name: "Шашлык из форели" });
     const match = evaluateIntent("легкий салат с рыбой", trout, "Шашлык из форели");
 
-    expect(match.matchedTerms).toContain("fish");
-    expect(match.matchedTerms).not.toContain("salad");
-    expect(match.intentCoverage).toBeLessThan(1);
-    expect(match.matchedIntent).toBe(false);
+    expect(match).toMatchObject({
+      requiredTerms: ["salad"],
+      modifierTerms: ["fish", "light"],
+      matchedTerms: [],
+      intentCoverage: 0,
+      matchedIntent: false,
+    });
   });
 
-  it("keeps specific proteins stricter than their broad fish category", () => {
+  it("requires the head concept before modifiers can contribute intent coverage", () => {
+    const lightTrout = normalizeDish({ name: "Легкая форель на пару" });
+    const lightSoup = normalizeDish({ name: "Овощной суп" });
+    const heavySoup = normalizeDish({ name: "Сливочный сырный суп" });
+
+    expect(evaluateIntent("легкий суп", lightTrout, "Легкая форель на пару")).toEqual({
+      intent: "легкий суп",
+      requiredTerms: ["soup"],
+      modifierTerms: ["light"],
+      matchedTerms: [],
+      intentCoverage: 0,
+      matchedIntent: false,
+    });
+    expect(evaluateIntent("легкий суп", lightSoup, "Овощной суп")).toMatchObject({
+      matchedTerms: ["soup", "light"],
+      intentCoverage: 1,
+      matchedIntent: true,
+    });
+    expect(evaluateIntent("легкий суп", heavySoup, "Сливочный сырный суп")).toMatchObject({
+      matchedTerms: ["soup"],
+      intentCoverage: 0.5,
+      matchedIntent: false,
+    });
+  });
+
+  it.each([
+    ["жареное мясо", "Креветки во фритюре", "meat", "fried"],
+    ["острый суп", "Острая курица", "soup", "spicy"],
+  ])("does not match %s from its modifier alone", (intent, name, required, modifier) => {
+    const dish = normalizeDish({ name });
+
+    expect(evaluateIntent(intent, dish, name)).toMatchObject({
+      requiredTerms: [required],
+      modifierTerms: [modifier],
+      matchedTerms: [],
+      intentCoverage: 0,
+      matchedIntent: false,
+    });
+  });
+
+  it.each([
+    "Креветки в кляре",
+    "Breaded shrimp",
+    "Crispy battered shrimp",
+    "Ծովախեցգետին տեմպուրա",
+  ])("treats batter, breading, tempura, and Armenian fried markers as heavy fried preparation: %s", (name) => {
+    const normalized = normalizeDish({ name });
+
+    expect(normalized.fried).toBe(true);
+    expect(normalized.heaviness).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it("does not treat pasta or a 500 gram noodle bowl as light", () => {
+    const tagliatelle = normalizeDish({ name: "Тальятелле с форелью" });
+    const noodleBowl = normalizeDish({ name: "Боул с лапшой и овощами", weight: "500 г" });
+
+    expect(tagliatelle.categories).toContain("pasta");
+    expect(tagliatelle.heaviness).toBeGreaterThan(0.45);
+    expect(evaluateIntent("легкая форель", tagliatelle, "Тальятелле с форелью").matchedTerms).toEqual(["trout"]);
+    expect(noodleBowl.heaviness).toBeGreaterThan(0.45);
+    expect(evaluateIntent("легкий боул", noodleBowl, "Боул с лапшой и овощами")).toMatchObject({
+      matchedTerms: ["bowl"],
+      intentCoverage: 0.5,
+      matchedIntent: false,
+    });
+  });
+
+  it("infers vegetarian only from positive ingredient or dietary evidence", () => {
+    expect(normalizeDish({ name: "Цезарь" }).vegetarian).toBe(false);
+    expect(normalizeDish({ name: "Поке с овощами" }).vegetarian).toBe(true);
+    expect(normalizeDish({ name: "Поке с овощами и курицей" }).vegetarian).toBe(false);
+    expect(normalizeDish({ name: "Вегетарианский салат" }).vegetarian).toBe(true);
+  });
+
+  it("keeps specific proteins required instead of matching on a cooking modifier alone", () => {
     const salmon = normalizeDish({ name: "Лосось на гриле" });
 
     expect(evaluateIntent("форель на гриле", salmon, "Лосось на гриле")).toMatchObject({
-      matchedTerms: ["grilled"],
-      intentCoverage: 0.5,
+      requiredTerms: ["trout"],
+      modifierTerms: ["grilled"],
+      matchedTerms: [],
+      intentCoverage: 0,
       matchedIntent: false,
     });
   });
@@ -156,6 +235,36 @@ describe("recommendation scoring and diversification", () => {
 
     expect(translated?.score).toBe(canonical?.score);
     expect(translated?.scoreReasons).toEqual(canonical?.scoreReasons);
+  });
+
+  it("ranks an exact dish-name match above a broader dish containing the same protein", () => {
+    const exactNormalized = normalizeDish({ name: "Форель" });
+    const broadNormalized = normalizeDish({ name: "Салат с форелью" });
+    const exactMatch = evaluateIntent("форель", exactNormalized, "Форель");
+    const broadMatch = evaluateIntent("форель", broadNormalized, "Салат с форелью");
+    const exact = scoreSearchCandidate(makeCandidate({
+      name: "Форель",
+      normalized: exactNormalized,
+      relevance: 1,
+      matchedTerms: exactMatch.matchedTerms,
+      intentCoverage: exactMatch.intentCoverage,
+      matchedIntent: exactMatch.matchedIntent,
+      intentMatches: [exactMatch],
+      matchedIntents: ["форель"],
+    }), ["форель"]);
+    const broad = scoreSearchCandidate(makeCandidate({
+      name: "Салат с форелью",
+      normalized: broadNormalized,
+      relevance: 1,
+      matchedTerms: broadMatch.matchedTerms,
+      intentCoverage: broadMatch.intentCoverage,
+      matchedIntent: broadMatch.matchedIntent,
+      intentMatches: [broadMatch],
+      matchedIntents: ["форель"],
+    }), ["форель"]);
+
+    expect(exact.score).toBeGreaterThan(broad.score);
+    expect(exact.scoreReasons).toContain("exact name match");
   });
 
   it("rejects fish and chips from a light-dish heaviness constraint", () => {
@@ -213,6 +322,59 @@ describe("preference persistence", () => {
 });
 
 describe("recommendation orchestration", () => {
+  it("does not return a light non-soup for the compound search intent light soup", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "required-search-intent-"));
+    temporaryDirectories.push(directory);
+    const search = vi.fn().mockResolvedValue({
+      query: "легкий суп",
+      currency: "AMD",
+      places: [{
+        placeSlug: "mixed",
+        name: "Mixed",
+        business: "restaurant",
+        available: true,
+        eta: "20–30 min",
+        rating: "4.8",
+        promos: [],
+        items: [
+          { itemId: "trout", name: "Легкая форель на пару", price: 3000, currency: "AMD", adult: false, hasRequiredOptions: false },
+          { itemId: "soup", name: "Овощной суп", price: 1800, currency: "AMD", adult: false, hasRequiredOptions: false },
+        ],
+      }],
+    });
+    const getMenu = vi.fn().mockResolvedValue({
+      placeSlug: "mixed",
+      currency: "AMD",
+      categories: [{
+        categoryId: "main",
+        name: "Main",
+        available: true,
+        categories: [],
+        items: [
+          { itemId: "trout", name: "Легкая форель на пару", price: 3000, currency: "AMD", available: true, adult: false, optionGroups: [] },
+          { itemId: "soup", name: "Овощной суп", price: 1800, currency: "AMD", available: true, adult: false, optionGroups: [] },
+        ],
+      }],
+    });
+    const service = new RecommendationService(
+      { search, getMenu } as unknown as YandexEatsClient,
+      new FoodPreferenceStore(directory, createLogger("silent")),
+      createLogger("silent"),
+      { maxIntents: 6, maxMenus: 10, maxPagesPerQuery: 1, menuConcurrency: 2, menuCacheTtlMs: 60_000 },
+    );
+
+    const result = await service.searchItems({ queries: ["легкий суп"], maxItems: 10 });
+
+    expect(result.results.map((entry) => entry.itemId)).toEqual(["soup"]);
+    expect(result.results[0]?.intentMatches[0]).toMatchObject({
+      requiredTerms: ["soup"],
+      modifierTerms: ["light"],
+      matchedTerms: ["soup", "light"],
+      intentCoverage: 1,
+      matchedIntent: true,
+    });
+  });
+
   it("deduplicates places, verifies full menus, and excludes restaurant-only false positives", async () => {
     const directory = await mkdtemp(join(tmpdir(), "recommendation-service-"));
     temporaryDirectories.push(directory);
@@ -381,7 +543,14 @@ function makeCandidate(overrides: Partial<DishCandidate> = {}): DishCandidate {
     matchedTerms: ["dish"],
     intentCoverage: 1,
     matchedIntent: true,
-    intentMatches: [{ intent: "dish", matchedTerms: ["dish"], intentCoverage: 1, matchedIntent: true }],
+    intentMatches: [{
+      intent: "dish",
+      requiredTerms: ["dish"],
+      modifierTerms: [],
+      matchedTerms: ["dish"],
+      intentCoverage: 1,
+      matchedIntent: true,
+    }],
     matchedIntents: ["dish"],
     relevance: 0.8,
     ...overrides,

@@ -26,6 +26,19 @@ const SEARCH_TERMS: Record<string, { en: string; ru: string }> = {
 const FISH_PROTEINS = new Set(["salmon", "trout", "tuna", "white fish"]);
 const SEAFOOD_PROTEINS = new Set(["shrimp", "crab", "mussels", "squid"]);
 const MEAT_PROTEINS = new Set(["chicken", "beef", "pork", "lamb"]);
+const MODIFIER_TERMS = new Set([
+  "light",
+  "filling",
+  "spicy",
+  "vegetarian",
+  "fried",
+  "grilled",
+  "steamed",
+  "baked",
+  "raw",
+  "boiled",
+  "stewed",
+]);
 
 export function expandSearchIntents(input: {
   query: string;
@@ -72,14 +85,7 @@ function add(values: string[], value: string): void {
 export function evaluateIntent(intent: string, dish: NormalizedDish, text: string): IntentMatch {
   const extracted = extractIntentTerms(intent);
   const terms = extracted.length > 0 ? extracted : tokenize(intent);
-  const matchedTerms = terms.filter((term) => termMatches(term, dish, text));
-  const intentCoverage = terms.length === 0 ? 0 : matchedTerms.length / terms.length;
-  return {
-    intent,
-    matchedTerms,
-    intentCoverage: round(intentCoverage),
-    matchedIntent: terms.length > 0 && matchedTerms.length === terms.length,
-  };
+  return evaluateTerms(intent, terms, dish, text);
 }
 
 export function evaluateIntentGroup(
@@ -87,15 +93,7 @@ export function evaluateIntentGroup(
   dish: NormalizedDish,
   text: string,
 ): IntentMatch {
-  const alternatives = group.alternatives.map((terms) => {
-    const matchedTerms = terms.filter((term) => termMatches(term, dish, text));
-    return {
-      intent: group.label,
-      matchedTerms,
-      intentCoverage: terms.length === 0 ? 0 : matchedTerms.length / terms.length,
-      matchedIntent: terms.length > 0 && matchedTerms.length === terms.length,
-    };
-  });
+  const alternatives = group.alternatives.map((terms) => evaluateTerms(group.label, terms, dish, text));
   const best = alternatives.sort((left, right) =>
     Number(right.matchedIntent) - Number(left.matchedIntent) ||
     right.intentCoverage - left.intentCoverage ||
@@ -103,6 +101,8 @@ export function evaluateIntentGroup(
   )[0];
   return best ? { ...best, intentCoverage: round(best.intentCoverage) } : {
     intent: group.label,
+    requiredTerms: [],
+    modifierTerms: [],
     matchedTerms: [],
     intentCoverage: 0,
     matchedIntent: false,
@@ -155,12 +155,36 @@ export function extractIntentTerms(value: string): string[] {
   });
   if (LIGHT.test(value)) terms.push("light");
   if (FILLING.test(value)) terms.push("filling");
+  if (/(spicy|hot|остр\p{L}*)/iu.test(value)) terms.push("spicy");
+  if (/(vegetarian|vegan|plant based|вегетариан\p{L}*|веган\p{L}*)/iu.test(value)) terms.push("vegetarian");
   return unique(terms);
 }
 
+function evaluateTerms(intent: string, terms: string[], dish: NormalizedDish, text: string): IntentMatch {
+  const requiredTerms = terms.filter((term) => !MODIFIER_TERMS.has(term)).slice(0, 1);
+  const modifierTerms = terms.filter((term) => !requiredTerms.includes(term));
+  const matchedRequiredTerms = requiredTerms.filter((term) => termMatches(term, dish, text));
+  const requiredSatisfied = requiredTerms.length === 0 || matchedRequiredTerms.length === requiredTerms.length;
+  const matchedModifierTerms = modifierTerms.filter((term) => termMatches(term, dish, text));
+  const matchedSet = new Set([...matchedRequiredTerms, ...matchedModifierTerms]);
+  const matchedTerms = requiredSatisfied ? terms.filter((term) => matchedSet.has(term)) : [];
+  const intentCoverage = requiredSatisfied && terms.length > 0 ? matchedTerms.length / terms.length : 0;
+
+  return {
+    intent,
+    requiredTerms,
+    modifierTerms,
+    matchedTerms,
+    intentCoverage: round(intentCoverage),
+    matchedIntent: terms.length > 0 && requiredSatisfied && matchedTerms.length === terms.length,
+  };
+}
+
 function termMatches(term: string, dish: NormalizedDish, text: string): boolean {
-  if (term === "light") return dish.heaviness <= 0.6;
+  if (term === "light") return dish.heaviness < 0.45;
   if (term === "filling") return dish.heaviness >= 0.55;
+  if (term === "spicy") return dish.spicy;
+  if (term === "vegetarian") return dish.vegetarian;
   if (term === "fish") return dish.categories.includes("fish") || dish.proteins.some((entry) => FISH_PROTEINS.has(entry));
   if (term === "seafood") return dish.categories.includes("seafood") || dish.proteins.some((entry) => SEAFOOD_PROTEINS.has(entry));
   if (term === "meat") return dish.categories.includes("meat") || dish.proteins.some((entry) => MEAT_PROTEINS.has(entry));

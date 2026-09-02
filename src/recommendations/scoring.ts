@@ -1,6 +1,44 @@
 import { canonicalValues, normalizeText, termMatchesDish, tokenize } from "./normalize.js";
 import type { DishCandidate, FoodPreference, FoodResult, RecommendFoodInput } from "./types.js";
 
+export function scoreSearchCandidate(candidate: DishCandidate, queries: string[]): FoodResult {
+  const bestIntent = [...candidate.intentMatches].sort((left, right) =>
+    Number(right.matchedIntent) - Number(left.matchedIntent) || right.intentCoverage - left.intentCoverage
+  )[0];
+  const intentSignal = bestIntent?.matchedIntent ? 1 : (bestIntent?.intentCoverage ?? 0);
+  const lexical = bestLexicalNameMatch(candidate, queries);
+  const semanticSignal = bestIntent?.requiredTerms.length
+    ? Number(bestIntent.requiredTerms.every((term) => bestIntent.matchedTerms.includes(term)))
+    : intentSignal;
+  const heavinessSignal = queryHeavinessSignal(queries, candidate.normalized.heaviness);
+  const weightSignal = queryWeightSignal(queries, candidate.weight);
+  const ratingSignal = candidate.rating === undefined ? 0.55 : clamp((candidate.rating - 3.5) / 1.5);
+  const eta = etaSignal(candidate.eta);
+  const score = candidate.relevance * 0.28 +
+    intentSignal * 0.22 +
+    lexical.signal * 0.18 +
+    semanticSignal * 0.1 +
+    heavinessSignal * 0.07 +
+    weightSignal * 0.04 +
+    ratingSignal * 0.07 +
+    eta * 0.04;
+  const reasons = [
+    bestIntent?.matchedIntent ? "full intent match" : `partial intent match (${bestIntent?.intentCoverage ?? 0})`,
+    ...(lexical.signal === 1 ? [lexical.source === "searchName" ? "exact translated-name match" : "exact name match"] : []),
+    ...(semanticSignal === 1 && bestIntent?.requiredTerms.length ? [`required concept: ${bestIntent.requiredTerms.join(", ")}`] : []),
+    ...(heavinessSignal !== 0.5 ? [`heaviness fit (${candidate.normalized.heaviness})`] : []),
+    ...(weightSignal !== 0.5 && candidate.weight ? [`weight fit (${candidate.weight})`] : []),
+    ...(candidate.rating !== undefined ? [`restaurant rating ${candidate.rating}`] : []),
+    ...(candidate.eta && eta > 0.5 ? [`delivery ETA ${candidate.eta}`] : []),
+  ];
+
+  return {
+    ...stripRelevance(candidate),
+    score: round(clamp(score)),
+    scoreReasons: reasons.slice(0, 6),
+  };
+}
+
 export function scoreCandidate(
   candidate: DishCandidate,
   input: RecommendFoodInput,
@@ -131,6 +169,72 @@ function uniqueSemanticTerms(terms: string[]): string[] {
     seen.add(key);
     return true;
   });
+}
+
+function bestLexicalNameMatch(
+  candidate: DishCandidate,
+  queries: string[],
+): { signal: number; source: "name" | "searchName" } {
+  let best: { signal: number; source: "name" | "searchName" } = { signal: 0, source: "name" };
+  for (const query of queries) {
+    for (const [source, name] of [["name", candidate.name], ["searchName", candidate.searchName]] as const) {
+      if (!name) continue;
+      const signal = lexicalNameSignal(name, query);
+      if (signal > best.signal) best = { signal, source };
+    }
+  }
+  return best;
+}
+
+function lexicalNameSignal(name: string, query: string): number {
+  const normalizedName = normalizeText(name);
+  const normalizedQuery = normalizeText(query);
+  if (!normalizedName || !normalizedQuery) return 0;
+  if (normalizedName === normalizedQuery) return 1;
+  const nameTokens = tokenize(name);
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0 || nameTokens.length === 0) return 0;
+  const matched = queryTokens.filter((queryToken) =>
+    nameTokens.some((nameToken) => nameToken.startsWith(queryToken) || queryToken.startsWith(nameToken)),
+  ).length;
+  const coverage = matched / queryTokens.length;
+  const compactness = Math.min(1, queryTokens.length / nameTokens.length);
+  return clamp(coverage * (0.65 + compactness * 0.35));
+}
+
+function queryHeavinessSignal(queries: string[], heaviness: number): number {
+  const query = queries.join(" ");
+  if (/(light|healthy|not too heavy|л[её]гк\p{L}*|не тяжел\p{L}*|полезн\p{L}*)/iu.test(query)) {
+    return 1 - heaviness;
+  }
+  if (/(filling|substantial|satisfying|сытн\p{L}*|насыт\p{L}*)/iu.test(query)) return heaviness;
+  return 0.5;
+}
+
+function queryWeightSignal(queries: string[], weight?: string): number {
+  if (!weight) return 0.5;
+  const grams = parseWeightGrams(weight);
+  if (grams === undefined) return 0.5;
+  const query = queries.join(" ");
+  if (/(light|healthy|not too heavy|л[её]гк\p{L}*|не тяжел\p{L}*|полезн\p{L}*)/iu.test(query)) {
+    return clamp(1 - grams / 700);
+  }
+  if (/(filling|substantial|satisfying|сытн\p{L}*|насыт\p{L}*)/iu.test(query)) return clamp(grams / 600);
+  return 0.5;
+}
+
+function parseWeightGrams(weight: string): number | undefined {
+  const normalized = weight.replace(",", ".");
+  const amount = Number.parseFloat(normalized.replace(/[^\d.]/g, ""));
+  if (!Number.isFinite(amount)) return undefined;
+  return /\bkg\b|кг/iu.test(normalized) ? amount * 1000 : amount;
+}
+
+function etaSignal(eta?: string): number {
+  if (!eta) return 0.5;
+  const minutes = Number.parseInt(eta.match(/\d+/u)?.[0] ?? "", 10);
+  if (!Number.isFinite(minutes)) return 0.5;
+  return clamp(1 - (minutes - 15) / 60);
 }
 
 function clamp(value: number): number {

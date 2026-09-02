@@ -14,6 +14,8 @@ export const normalizedDishSchema = z.object({
 
 export const intentMatchSchema = z.object({
   intent: z.string(),
+  requiredTerms: z.array(z.string()),
+  modifierTerms: z.array(z.string()),
   matchedTerms: z.array(z.string()),
   intentCoverage: z.number().min(0).max(1),
   matchedIntent: z.boolean(),

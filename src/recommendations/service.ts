@@ -9,7 +9,7 @@ import {
   parseRecommendationIntentGroups,
 } from "./intents.js";
 import { normalizeDish, normalizeText } from "./normalize.js";
-import { calculateRelevance, scoreCandidate } from "./scoring.js";
+import { calculateRelevance, scoreCandidate, scoreSearchCandidate } from "./scoring.js";
 import type {
   DishCandidate,
   FoodResult,
@@ -68,22 +68,17 @@ export class RecommendationService {
       maxPagesPerQuery: Math.min(input.maxPagesPerQuery ?? this.options.maxPagesPerQuery, this.options.maxPagesPerQuery),
     });
     const maxItems = input.maxItems ?? 50;
-    const results = gathered.candidates
-      .map((candidate) => ({
-        ...stripRelevance(candidate),
-        score: round(candidate.relevance * 0.85 + ratingSignal(candidate.rating) * 0.15),
-        scoreReasons: [
-          candidate.matchedIntent ? "full intent match" : `partial intent match (${candidate.intentCoverage})`,
-          ...(candidate.rating !== undefined ? [`restaurant rating ${candidate.rating}`] : []),
-        ],
-      }))
+    const scored = gathered.candidates
+      .map((candidate) => scoreSearchCandidate(candidate, queries))
       .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    const candidates = input.deduplicate === false ? scored : deduplicateResults(scored);
+    const results = rankSearchResults(candidates, maxItems);
 
     return {
       queries,
       candidatePlaces: gathered.candidatePlaces,
       menusLoaded: gathered.menusLoaded,
-      results: input.deduplicate === false ? results.slice(0, maxItems) : deduplicateResults(results).slice(0, maxItems),
+      results,
       warnings: gathered.warnings,
     };
   }
@@ -394,6 +389,38 @@ function deduplicateResults(results: FoodResult[]): FoodResult[] {
   });
 }
 
+function rankSearchResults(results: FoodResult[], limit: number): FoodResult[] {
+  const remaining = [...results];
+  const selected: FoodResult[] = [];
+  const restaurantCounts = new Map<string, number>();
+  const categoryCounts = new Map<string, number>();
+
+  while (remaining.length > 0 && selected.length < limit) {
+    let bestIndex = 0;
+    let bestUtility = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const candidate = remaining[index];
+      if (!candidate) continue;
+      const category = candidate.normalized.categories[0] ?? candidate.menuCategories[0] ?? "other";
+      const restaurantPenalty = Math.min(0.06, (restaurantCounts.get(candidate.placeSlug) ?? 0) * 0.025);
+      const categoryPenalty = Math.min(0.03, (categoryCounts.get(category) ?? 0) * 0.01);
+      const utility = candidate.score - restaurantPenalty - categoryPenalty;
+      if (utility > bestUtility) {
+        bestUtility = utility;
+        bestIndex = index;
+      }
+    }
+    const [chosen] = remaining.splice(bestIndex, 1);
+    if (!chosen) break;
+    selected.push(chosen);
+    restaurantCounts.set(chosen.placeSlug, (restaurantCounts.get(chosen.placeSlug) ?? 0) + 1);
+    const category = chosen.normalized.categories[0] ?? chosen.menuCategories[0] ?? "other";
+    categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1);
+  }
+
+  return selected;
+}
+
 function selectSameRestaurantResults(
   candidates: FoodResult[],
   groups: RecommendationIntentGroup[],
@@ -504,12 +531,6 @@ function parseRating(value?: string): number | undefined {
 
 function ratingSignal(value?: number): number {
   return value === undefined ? 0.55 : Math.max(0, Math.min(1, (value - 3.5) / 1.5));
-}
-
-function stripRelevance(candidate: DishCandidate): Omit<DishCandidate, "relevance"> {
-  const { relevance, ...result } = candidate;
-  void relevance;
-  return result;
 }
 
 function round(value: number): number {
