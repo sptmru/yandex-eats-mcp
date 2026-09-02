@@ -40,7 +40,7 @@ https://eats.yandex.com
 
 The process-level `OrderMonitor` is independent of MCP request sessions. It polls Yandex's read-only order endpoints, writes sanitized state to `/app/state/order-monitor-state.json`, appends cursor-addressable events to `/app/state/order-events.jsonl`, and optionally sends a minimal Telegram message.
 
-The recommendation layer is independent of the private-API mappers. It expands a natural-language request into a bounded set of search intents, deduplicates restaurant candidates across searches and pagination, loads up to 12 current menus with concurrency limited to 3, and keeps only matching available items. Deterministic normalization and scoring run locally; no LLM or external recommendation service is called. Final selection combines score, restaurant/category quotas, and an MMR-like similarity penalty.
+The recommendation layer is independent of the private-API mappers. It expands a natural-language request into a bounded, canonically deduplicated set of search intents, deduplicates restaurant candidates across searches and pagination, loads up to 12 current menus with concurrency limited to 3, and keeps only matching available items. Deterministic normalization and scoring run locally; no LLM or external recommendation service is called. Final selection combines constraint coverage, score, restaurant/category quotas, and an MMR-like similarity penalty. Multi-person requests such as `Маше X, мне Y, из одного ресторана` are split into intent groups and rank restaurants by group coverage before selecting one distinct dish per group.
 
 Explicit food preferences are stored atomically in `/app/state/food-preferences.json`. Automatic order-history import is intentionally not enabled: Yandex can return historical order shells without stable menu-item metadata, so the server only records signals explicitly supplied through `record_food_feedback`.
 
@@ -205,11 +205,12 @@ After any successful mutation, the MCP reloads and returns the server cart. Budg
   "maxPerRestaurant": 2,
   "maxPerCategory": 2,
   "exploration": 0.6,
+  "sameRestaurant": false,
   "limit": 10
 }
 ```
 
-Each result includes restaurant metadata, item ID/name/description/price/weight, an optional translated `searchName` from Yandex's search projection, normalized food attributes, a 0..1 score, and concise `scoreReasons`. Search item IDs are joined back to full-menu item IDs, so a translated search hit can verify a menu item even when the restaurant publishes its full menu in another language. `heaviness` is an inspectable recommendation heuristic based on dish wording, preparation, sauce, category, and stated weight. It is not nutritional or medical data.
+Each result includes restaurant metadata, item ID/name/description/price/weight, an optional translated `searchName` from Yandex's search projection, normalized food attributes, `matchedTerms`, `intentCoverage`, `matchedIntent`, per-query `intentMatches`, a 0..1 score, and concise `scoreReasons`. `matchedIntents` contains only fully covered intents; a search hit alone is not treated as a full match. Search item IDs are joined back to full-menu item IDs, so a translated search hit can verify a menu item even when the restaurant publishes its full menu in another language. `heaviness` is an inspectable recommendation heuristic based on dish wording, preparation, compound-dish rules, sauce, category, and stated weight. It is not nutritional or medical data. Missing Armenian-market currency metadata is normalized to `AMD`, including the `֏` sign.
 
 For an explicit multi-query search without preference-aware ranking, use:
 
@@ -309,3 +310,5 @@ No live test in this repository creates an order. Normal tests never contact Yan
 - `REQUIRES_CONFIGURATION`: inspect `get_menu` and ask the user to choose required options.
 - `UNSUPPORTED_CART_MODE`: current release refuses unsupported SKU/pickup cart flows.
 - `MUTATION_STATUS_UNKNOWN`: do not retry blindly; reconcile with `get_cart`.
+
+[![M8ven Score](https://m8ven.ai/badge/mcp/sptmru-yandex-eats-mcp-4a62fs?v=6de9d4a3f48e8403cd283fb768e7655b)](https://m8ven.ai/mcp/sptmru-yandex-eats-mcp-4a62fs)
