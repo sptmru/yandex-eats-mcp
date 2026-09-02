@@ -14,6 +14,7 @@ import type {
   DishCandidate,
   FoodResult,
   FoodSearchResult,
+  IntentMatch,
   RecommendFoodInput,
   RecommendationIntentGroup,
   RecommendationResult,
@@ -119,6 +120,7 @@ export class RecommendationService {
       query: input.query,
       searchIntents,
       intentGroups: parsedIntent.groups,
+      excludedTerms: parsedIntent.excludedTerms,
       sameRestaurant,
       ...(grouped?.restaurantCoverage ? { restaurantCoverage: grouped.restaurantCoverage } : {}),
       candidatePlaces: gathered.candidatePlaces,
@@ -421,7 +423,7 @@ function rankSearchResults(results: FoodResult[], limit: number): FoodResult[] {
   return selected;
 }
 
-function selectSameRestaurantResults(
+export function selectSameRestaurantResults(
   candidates: FoodResult[],
   groups: RecommendationIntentGroup[],
   limit: number,
@@ -450,16 +452,20 @@ function selectSameRestaurantResults(
           candidate,
           match: evaluateIntentGroup(group, candidate.normalized, candidateText(candidate)),
         }))
-        .filter((entry) => entry.match.matchedIntent)
-        .sort((left, right) => right.candidate.score - left.candidate.score),
+        .filter((entry) => entry.match.intentCoverage > 0 && entry.match.matchedExcludedTerms.length === 0)
+        .sort((left, right) =>
+          Number(right.match.matchedIntent) - Number(left.match.matchedIntent) ||
+          right.match.intentCoverage - left.match.intentCoverage ||
+          right.candidate.score - left.candidate.score
+        ),
     })).sort((left, right) => left.candidates.length - right.candidates.length);
     const used = new Set<string>();
-    const selected: Array<{ groupIndex: number; candidate: FoodResult }> = [];
+    const selected: Array<{ groupIndex: number; candidate: FoodResult; match: IntentMatch }> = [];
     for (const option of options) {
       const match = option.candidates.find((entry) => !used.has(entry.candidate.itemId));
       if (!match) continue;
       used.add(match.candidate.itemId);
-      selected.push({ groupIndex: option.groupIndex, candidate: match.candidate });
+      selected.push({ groupIndex: option.groupIndex, candidate: match.candidate, match: match.match });
     }
     selected.sort((left, right) => left.groupIndex - right.groupIndex);
     return {
@@ -467,10 +473,16 @@ function selectSameRestaurantResults(
       placeName: restaurantCandidates[0]?.placeName ?? placeSlug,
       selected: selected.map((entry) => entry.candidate),
       matchedGroups: selected.length,
+      fullGroups: selected.filter((entry) => entry.match.matchedIntent).length,
+      coverageScore: selected.reduce((total, entry) => total + entry.match.intentCoverage, 0),
       score: selected.reduce((total, entry) => total + entry.candidate.score, 0),
     };
   }).sort((left, right) =>
-    right.matchedGroups - left.matchedGroups || right.score - left.score || left.placeName.localeCompare(right.placeName)
+    right.coverageScore - left.coverageScore ||
+    right.fullGroups - left.fullGroups ||
+    right.matchedGroups - left.matchedGroups ||
+    right.score - left.score ||
+    left.placeName.localeCompare(right.placeName)
   );
 
   const best = ranked[0];
@@ -482,7 +494,7 @@ function selectSameRestaurantResults(
       placeName: best.placeName,
       matchedGroups: best.matchedGroups,
       totalGroups: groups.length,
-      coverage: round(best.matchedGroups / groups.length),
+      coverage: round(best.coverageScore / groups.length),
     },
   };
 }

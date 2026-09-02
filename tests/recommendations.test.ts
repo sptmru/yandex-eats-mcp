@@ -13,7 +13,7 @@ import {
 import { normalizeDish } from "../src/recommendations/normalize.js";
 import { FoodPreferenceStore } from "../src/recommendations/preferences-store.js";
 import { scoreCandidate, scoreSearchCandidate } from "../src/recommendations/scoring.js";
-import { RecommendationService } from "../src/recommendations/service.js";
+import { RecommendationService, selectSameRestaurantResults } from "../src/recommendations/service.js";
 import type { DishCandidate, FoodResult } from "../src/recommendations/types.js";
 import { createLogger } from "../src/logger.js";
 
@@ -38,7 +38,8 @@ describe("dish normalization", () => {
 
     expect(light.categories).toEqual(expect.arrayContaining(["salad", "fish"]));
     expect(light.proteins).toContain("salmon");
-    expect(light.cookingMethods).toEqual(expect.arrayContaining(["grilled", "baked"]));
+    expect(light.cookingMethods).toContain("grilled");
+    expect(light.ingredientCookingMethods).toContain("baked");
     expect(heavy.fried).toBe(true);
     expect(heavy.creamy).toBe(true);
     expect(light.heaviness).toBeLessThan(heavy.heaviness);
@@ -107,7 +108,7 @@ describe("dish normalization", () => {
     const lightSoup = normalizeDish({ name: "Овощной суп" });
     const heavySoup = normalizeDish({ name: "Сливочный сырный суп" });
 
-    expect(evaluateIntent("легкий суп", lightTrout, "Легкая форель на пару")).toEqual({
+    expect(evaluateIntent("легкий суп", lightTrout, "Легкая форель на пару")).toMatchObject({
       intent: "легкий суп",
       requiredTerms: ["soup"],
       modifierTerms: ["light"],
@@ -122,7 +123,7 @@ describe("dish normalization", () => {
     });
     expect(evaluateIntent("легкий суп", heavySoup, "Сливочный сырный суп")).toMatchObject({
       matchedTerms: ["soup"],
-      intentCoverage: 0.5,
+      intentCoverage: 0.7,
       matchedIntent: false,
     });
   });
@@ -164,7 +165,7 @@ describe("dish normalization", () => {
     expect(noodleBowl.heaviness).toBeGreaterThan(0.45);
     expect(evaluateIntent("легкий боул", noodleBowl, "Боул с лапшой и овощами")).toMatchObject({
       matchedTerms: ["bowl"],
-      intentCoverage: 0.5,
+      intentCoverage: 0.7,
       matchedIntent: false,
     });
   });
@@ -201,11 +202,100 @@ describe("dish normalization", () => {
       "На двоих из одного ресторана: Маше жареное мясо, мне легкое рыбное блюдо или салат.",
     )).toEqual({
       sameRestaurant: true,
+      excludedTerms: [],
       groups: [
-        { id: "group-1", label: "Маше", alternatives: [["meat", "fried"]] },
-        { id: "group-2", label: "мне", alternatives: [["fish", "light"], ["salad", "light"]] },
+        { id: "group-1", label: "Маше", alternatives: [["meat", "fried"]], excludedTerms: [] },
+        { id: "group-2", label: "мне", alternatives: [["fish", "light"], ["salad", "light"]], excludedTerms: [] },
       ],
     });
+  });
+
+  it("keeps negated concepts out of positive intents and exposes hard exclusions", () => {
+    const query = "Легкий салат без жареного, не сливочный";
+    const parsed = parseRecommendationIntentGroups(query);
+    const lightSalad = normalizeDish({ name: "Легкий овощной салат" });
+    const friedSalad = normalizeDish({ name: "Жареный салат" });
+
+    expect(expandSearchIntents({ query })).not.toContain("жареное");
+    expect(parsed.excludedTerms).toEqual(["fried", "creamy"]);
+    expect(parsed.groups[0]).toMatchObject({
+      alternatives: [["salad", "light"]],
+      excludedTerms: ["fried", "creamy"],
+    });
+    expect(evaluateIntent(query, lightSalad, "Легкий овощной салат")).toMatchObject({
+      requiredTerms: ["salad"],
+      preferredTerms: ["light"],
+      excludedTerms: ["fried", "creamy"],
+      matchedExcludedTerms: [],
+      intentCoverage: 1,
+      matchedIntent: true,
+    });
+    const excludedMatch = evaluateIntent(query, friedSalad, "Жареный салат");
+    expect(excludedMatch).toMatchObject({
+      matchedExcludedTerms: ["fried"],
+      intentCoverage: 0,
+      matchedIntent: false,
+    });
+    expect(scoreCandidate(makeCandidate({
+      name: "Жареный салат",
+      normalized: friedSalad,
+      intentMatches: [excludedMatch],
+    }), { query }, [])).toBeUndefined();
+  });
+
+  it("parses English two-person alternatives and global negative constraints", () => {
+    const parsed = parseRecommendationIntentGroups(
+      "Two people: one wants grilled or roasted meat, the other wants a light fish or seafood dish or salad. " +
+      "Avoid fried and creamy food. Ideally both from the same restaurant.",
+    );
+
+    expect(parsed).toMatchObject({
+      sameRestaurant: true,
+      excludedTerms: ["fried", "creamy"],
+      groups: [
+        {
+          label: "one",
+          alternatives: [["meat", "grilled"], ["meat", "baked"]],
+          excludedTerms: ["fried", "creamy"],
+        },
+        {
+          label: "the other",
+          alternatives: [["fish", "light"], ["seafood", "light"], ["salad", "light"]],
+          excludedTerms: ["fried", "creamy"],
+        },
+      ],
+    });
+  });
+
+  it("preserves unknown meaningful lexical phrases as preferred terms", () => {
+    const trout = normalizeDish({ name: "Форель" });
+    const exact = evaluateIntent("форель salsa verde", trout, "Форель с соусом salsa verde");
+    const broad = evaluateIntent("форель salsa verde", trout, "Форель");
+
+    expect(exact).toMatchObject({
+      requiredTerms: ["trout"],
+      preferredTerms: ["salsa verde"],
+      lexicalTerms: ["salsa verde"],
+      intentCoverage: 1,
+      matchedIntent: true,
+    });
+    expect(broad).toMatchObject({
+      matchedTerms: ["trout"],
+      intentCoverage: 0.7,
+      matchedIntent: false,
+    });
+  });
+
+  it("scopes a fried garnish to ingredient cooking methods", () => {
+    const trout = normalizeDish({
+      name: "Филе форели с соусом salsa verde",
+      description: "Подается с жареным болгарским перцем",
+    });
+
+    expect(trout.cookingMethods).not.toContain("fried");
+    expect(trout.ingredientCookingMethods).toContain("fried");
+    expect(trout.fried).toBe(false);
+    expect(trout.heaviness).toBeLessThan(0.6);
   });
 
   it("decomposes a natural-language noun list and applies light to every alternative", () => {
@@ -360,6 +450,35 @@ describe("recommendation scoring and diversification", () => {
     expect(selected).toHaveLength(3);
     expect(new Set(selected.map((entry) => entry.placeSlug)).size).toBe(3);
     expect(selected.filter((entry) => entry.normalized.categories.includes("fish"))).toHaveLength(1);
+  });
+
+  it("selects the same restaurant by summed best coverage across every intent group", () => {
+    const parsed = parseRecommendationIntentGroups(
+      "Same restaurant: one wants grilled meat, the other wants light fish",
+    );
+    const partialMeat = makeResult("partial", "plain-meat", "meat", 0.8);
+    partialMeat.name = "Beef";
+    partialMeat.normalized = normalizeDish({ name: partialMeat.name });
+    const partialFish = makeResult("partial", "plain-fish", "fish", 0.8);
+    partialFish.name = "Salmon";
+    partialFish.normalized = normalizeDish({ name: partialFish.name });
+    const singleFull = makeResult("single", "grilled-meat", "meat", 0.95);
+    singleFull.name = "Grilled beef";
+    singleFull.normalized = normalizeDish({ name: singleFull.name });
+
+    const selected = selectSameRestaurantResults(
+      [singleFull, partialMeat, partialFish],
+      parsed.groups,
+      10,
+    );
+
+    expect(selected?.restaurantCoverage).toMatchObject({
+      placeSlug: "partial",
+      matchedGroups: 2,
+      totalGroups: 2,
+      coverage: 0.7,
+    });
+    expect(selected?.results.map((entry) => entry.itemId)).toEqual(["plain-meat", "plain-fish"]);
   });
 });
 
@@ -612,7 +731,11 @@ function makeCandidate(overrides: Partial<DishCandidate> = {}): DishCandidate {
     intentMatches: [{
       intent: "dish",
       requiredTerms: ["dish"],
+      preferredTerms: [],
       modifierTerms: [],
+      lexicalTerms: [],
+      excludedTerms: [],
+      matchedExcludedTerms: [],
       matchedTerms: ["dish"],
       intentCoverage: 1,
       matchedIntent: true,

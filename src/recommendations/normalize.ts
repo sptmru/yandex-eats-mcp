@@ -152,17 +152,25 @@ export function normalizeDish(input: {
   menuCategories?: string[] | undefined;
   weight?: string | undefined;
 }): NormalizedDish {
-  const text = normalizeText([input.name, input.description, ...(input.menuCategories ?? [])].filter(Boolean).join(" "));
-  const compounds = COMPOUND_RULES.filter((entry) => matchesAny(text, entry.patterns));
+  const primaryText = normalizeText([input.name, ...(input.menuCategories ?? [])].filter(Boolean).join(" "));
+  const descriptionText = normalizeText(input.description ?? "");
+  const text = normalizeText([primaryText, descriptionText].filter(Boolean).join(" "));
+  const primaryCompounds = COMPOUND_RULES.filter((entry) => matchesAny(primaryText, entry.patterns));
+  const ingredientCompounds = COMPOUND_RULES.filter((entry) => matchesAny(descriptionText, entry.patterns));
+  const compounds = unique([...primaryCompounds, ...ingredientCompounds]);
   const categories = unique([
     ...matchRules(text, CATEGORY_RULES),
     ...compounds.flatMap((entry) => entry.categories ?? []),
   ]);
   const proteins = matchRules(text, PROTEIN_RULES);
   const cookingMethods = unique([
-    ...matchRules(text, METHOD_RULES),
-    ...compounds.flatMap((entry) => entry.cookingMethods ?? []),
+    ...matchRules(primaryText, METHOD_RULES),
+    ...primaryCompounds.flatMap((entry) => entry.cookingMethods ?? []),
   ]);
+  const ingredientCookingMethods = unique([
+    ...matchRules(descriptionText, METHOD_RULES),
+    ...ingredientCompounds.flatMap((entry) => entry.cookingMethods ?? []),
+  ]).filter((method) => !cookingMethods.includes(method));
   const cuisines = matchRules(text, CUISINE_RULES);
   const fried = cookingMethods.includes("fried");
   const creamy = matchesAny(text, CREAMY) || compounds.some((entry) => entry.creamy);
@@ -180,17 +188,20 @@ export function normalizeDish(input: {
   if (categories.includes("poke") || categories.includes("bowl")) heaviness -= 0.08;
   if (cookingMethods.includes("grilled") || cookingMethods.includes("steamed") || cookingMethods.includes("boiled")) heaviness -= 0.1;
   if (fried) heaviness += 0.28;
+  if (ingredientCookingMethods.includes("fried")) heaviness += 0.05;
   if (creamy) heaviness += 0.18;
   if (categories.includes("pizza") || categories.includes("sandwich") || categories.includes("pasta")) heaviness += 0.18;
   if (matchesAny(text, HEAVY)) heaviness += 0.12;
   if (matchesAny(text, LIGHT)) heaviness -= 0.12;
-  heaviness += compounds.reduce((total, entry) => total + entry.heaviness, 0);
+  heaviness += primaryCompounds.reduce((total, entry) => total + entry.heaviness, 0);
+  heaviness += ingredientCompounds.reduce((total, entry) => total + Math.min(entry.heaviness, 0.05), 0);
   heaviness += weightAdjustment(input.weight);
 
   return {
     categories: unique(categories),
     proteins: unique(proteins),
     cookingMethods: unique(cookingMethods),
+    ingredientCookingMethods,
     cuisines: unique(cuisines),
     spicy,
     fried,
@@ -216,18 +227,23 @@ export function tokenize(value: string): string[] {
 export function termMatchesDish(term: string, dish: NormalizedDish, text: string): boolean {
   const normalized = normalizeText(term);
   if (!normalized) return false;
+  if (normalized === "light") return dish.heaviness < 0.45;
+  if (normalized === "filling") return dish.heaviness >= 0.55;
+  if (normalized === "creamy") return dish.creamy;
+  if (normalized === "spicy") return dish.spicy;
+  if (normalized === "vegetarian" || normalized === "vegan") return dish.vegetarian;
   const canonical = canonicalValues(normalized);
   const specificProteins = canonical.filter((value) => PROTEIN_RULES.some((entry) => entry.value === value));
   const semanticValues = specificProteins.length > 0 ? specificProteins : canonical;
-  return (
-    matchesAny(normalizeText(text), patterns(normalized)) ||
-    semanticValues.some((value) =>
+  if (semanticValues.length > 0) {
+    return semanticValues.some((value) =>
       dish.categories.includes(value) ||
       dish.proteins.includes(value) ||
       dish.cookingMethods.includes(value) ||
       dish.cuisines.includes(value),
-    )
-  );
+    );
+  }
+  return matchesAny(normalizeText(text), patterns(normalized));
 }
 
 export function canonicalValues(value: string): string[] {
@@ -296,6 +312,7 @@ function escapeRegExp(value: string): string {
 }
 
 const STOP_WORDS = new Set([
-  "and", "the", "with", "for", "from", "give", "want", "something", "please", "lunch", "dinner",
-  "или", "для", "мне", "хочу", "дай", "что", "нибудь", "пожалуйста", "обед", "ужин", "блюдо",
+  "and", "the", "with", "for", "from", "give", "want", "wants", "something", "anything", "please",
+  "lunch", "dinner", "food", "dish", "one", "other", "people", "person", "ideally", "both", "same", "restaurant",
+  "или", "либо", "для", "мне", "хочу", "дай", "что", "нибудь", "пожалуйста", "обед", "ужин", "блюдо",
 ]);

@@ -47,6 +47,7 @@ export function scoreCandidate(
   const text = [candidate.name, candidate.searchName, candidate.description, ...candidate.menuCategories].filter(Boolean).join(" ");
   if (input.maxPrice !== undefined && candidate.price > input.maxPrice) return undefined;
   if (input.maxHeaviness !== undefined && candidate.normalized.heaviness > input.maxHeaviness) return undefined;
+  if (candidate.intentMatches.some((match) => match.matchedExcludedTerms.length > 0)) return undefined;
   if ((input.avoid ?? []).some((term) => termMatchesDish(term, candidate.normalized, text))) return undefined;
   if (input.categories?.length && !input.categories.some((term) => termMatchesDish(term, candidate.normalized, text))) {
     return undefined;

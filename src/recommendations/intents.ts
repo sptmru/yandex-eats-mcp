@@ -3,6 +3,7 @@ import type { IntentMatch, NormalizedDish, RecommendationIntentGroup } from "./t
 
 const LIGHT = /(light|healthy|not too heavy|л[её]гк\p{L}*|не тяжел\p{L}*|полезн\p{L}*)/iu;
 const FILLING = /(filling|substantial|satisfying|сытн\p{L}*|насыт\p{L}*)/iu;
+const CREAMY = /(cream|creamy|mayonnaise|mayo|сливоч\p{L}*|майонез\p{L}*)/iu;
 const VARIED = /(varied|diverse|different|variety|разн\p{L}*|разнообраз\p{L}*)/iu;
 const CYRILLIC = /\p{Script=Cyrillic}/u;
 
@@ -31,6 +32,7 @@ const MODIFIER_TERMS = new Set([
   "filling",
   "spicy",
   "vegetarian",
+  "creamy",
   "fried",
   "grilled",
   "steamed",
@@ -48,30 +50,34 @@ export function expandSearchIntents(input: {
   maxIntents?: number;
 }): string[] {
   const query = input.query.trim();
+  const { affirmativeText, excludedTerms } = parseNegation(query);
   const language = CYRILLIC.test(query) ? "ru" : "en";
   const explicit = [...(input.categories ?? []), ...(input.prefer ?? [])];
-  const canonical = new Set([...canonicalValues(query), ...explicit.flatMap(canonicalValues)]);
+  const excluded = new Set(excludedTerms);
+  const canonical = new Set(
+    [...canonicalValues(affirmativeText), ...explicit.flatMap(canonicalValues)].filter((term) => !excluded.has(term)),
+  );
   const intents: string[] = [];
 
   for (const value of explicit.filter((entry) => canonicalValues(entry).length === 0)) add(intents, value);
   for (const value of canonical) add(intents, SEARCH_TERMS[value]?.[language] ?? value);
 
-  if (LIGHT.test(query)) {
-    for (const value of FILLING.test(query)
+  if (LIGHT.test(affirmativeText)) {
+    for (const value of FILLING.test(affirmativeText)
       ? ["bowl", "poke", "soup", "grilled", "salad", "chicken"]
       : ["salad", "soup", "poke", "fish", "seafood"]) {
       add(intents, SEARCH_TERMS[value]?.[language] ?? value);
     }
   }
 
-  if (VARIED.test(query) && intents.length < 4) {
+  if (VARIED.test(affirmativeText) && intents.length < 4) {
     for (const value of ["fish", "seafood", "salad", "soup", "poke"]) {
       add(intents, SEARCH_TERMS[value]?.[language] ?? value);
     }
   }
 
-  const contentTokens = tokenize(query);
-  if (intents.length === 0 && contentTokens.length > 0) add(intents, query);
+  const contentTokens = tokenize(affirmativeText);
+  if (intents.length === 0 && contentTokens.length > 0) add(intents, affirmativeText);
   if (intents.length === 0) add(intents, language === "ru" ? "еда" : "food");
   return intents.slice(0, input.maxIntents ?? 6);
 }
@@ -86,7 +92,7 @@ function add(values: string[], value: string): void {
 export function evaluateIntent(intent: string, dish: NormalizedDish, text: string): IntentMatch {
   const extracted = extractIntentTerms(intent);
   const terms = extracted.length > 0 ? extracted : tokenize(intent);
-  return evaluateTerms(intent, terms, dish, text);
+  return evaluateTerms(intent, terms, extractExcludedTerms(intent), dish, text);
 }
 
 export function evaluateIntentGroup(
@@ -94,7 +100,9 @@ export function evaluateIntentGroup(
   dish: NormalizedDish,
   text: string,
 ): IntentMatch {
-  const alternatives = group.alternatives.map((terms) => evaluateTerms(group.label, terms, dish, text));
+  const alternatives = group.alternatives.map((terms) =>
+    evaluateTerms(group.label, terms, group.excludedTerms, dish, text)
+  );
   const best = alternatives.sort((left, right) =>
     Number(right.matchedIntent) - Number(left.matchedIntent) ||
     right.intentCoverage - left.intentCoverage ||
@@ -103,7 +111,11 @@ export function evaluateIntentGroup(
   return best ? { ...best, intentCoverage: round(best.intentCoverage) } : {
     intent: group.label,
     requiredTerms: [],
+    preferredTerms: [],
     modifierTerms: [],
+    lexicalTerms: [],
+    excludedTerms: group.excludedTerms,
+    matchedExcludedTerms: [],
     matchedTerms: [],
     intentCoverage: 0,
     matchedIntent: false,
@@ -113,7 +125,9 @@ export function evaluateIntentGroup(
 export function parseRecommendationIntentGroups(query: string): {
   groups: RecommendationIntentGroup[];
   sameRestaurant: boolean;
+  excludedTerms: string[];
 } {
+  const excludedTerms = extractExcludedTerms(query);
   const sameRestaurant = /(same restaurant|one restaurant|one place|из одного (?:ресторана|места)|в одном (?:ресторане|месте))/iu.test(query);
   const afterColon = query.includes(":") ? query.slice(query.indexOf(":") + 1) : query;
   const possibleGroups = afterColon.split(/[,;]+/u).map((entry) => entry.trim()).filter(Boolean);
@@ -127,24 +141,28 @@ export function parseRecommendationIntentGroups(query: string): {
   const groups = segments.map((segment, index) => {
     const { label, request } = stripPersonMarker(segment, index);
     const context = hasGroupBoundaries ? request : query;
-    const { alternatives, sharedQualifierTerms } = splitAlternativePhrases(request);
+    const { affirmativeText } = parseNegation(request);
+    const { alternatives, sharedQualifierTerms } = splitAlternativePhrases(affirmativeText);
     const commonTerms = extractCommonModifierTerms(context);
+    const parsedAlternatives = alternatives.map((alternative) => {
+      const terms = extractIntentTerms(alternative).filter((term) => !commonTerms.includes(term));
+      const fallback = terms.length === 0 ? tokenize(alternative).slice(0, 3) : terms;
+      return unique([...fallback, ...sharedQualifierTerms, ...commonTerms]);
+    }).filter((terms) => terms.length > 0);
     return {
       id: `group-${index + 1}`,
       label,
-      alternatives: alternatives.map((alternative) => {
-        const terms = extractIntentTerms(alternative).filter((term) => !commonTerms.includes(term));
-        const fallback = terms.length === 0 ? tokenize(alternative).slice(0, 3) : terms;
-        return unique([...fallback, ...sharedQualifierTerms, ...commonTerms]);
-      }).filter((terms) => terms.length > 0),
+      alternatives: propagateSharedRequiredTerm(parsedAlternatives),
+      excludedTerms,
     };
   }).filter((group) => group.alternatives.length > 0);
 
-  return { groups, sameRestaurant };
+  return { groups, sameRestaurant, excludedTerms };
 }
 
 export function extractIntentTerms(value: string): string[] {
-  const canonical = canonicalValues(value);
+  const { affirmativeText } = parseNegation(value);
+  const canonical = canonicalValues(affirmativeText);
   const proteins = canonical.filter((entry) =>
     FISH_PROTEINS.has(entry) || SEAFOOD_PROTEINS.has(entry) || MEAT_PROTEINS.has(entry),
   );
@@ -154,30 +172,48 @@ export function extractIntentTerms(value: string): string[] {
     if (entry === "meat" && proteins.some((protein) => MEAT_PROTEINS.has(protein))) return false;
     return true;
   });
-  if (LIGHT.test(value)) terms.push("light");
-  if (FILLING.test(value)) terms.push("filling");
-  if (/(spicy|hot|остр\p{L}*)/iu.test(value)) terms.push("spicy");
-  if (/(vegetarian|vegan|plant based|вегетариан\p{L}*|веган\p{L}*)/iu.test(value)) terms.push("vegetarian");
-  return unique(terms);
+  terms.push(...extractModifierTerms(affirmativeText));
+  const knownTerms = unique(terms);
+  return unique([...knownTerms, ...extractLexicalTerms(affirmativeText)]);
 }
 
-function evaluateTerms(intent: string, terms: string[], dish: NormalizedDish, text: string): IntentMatch {
+function evaluateTerms(
+  intent: string,
+  terms: string[],
+  excludedTerms: string[],
+  dish: NormalizedDish,
+  text: string,
+): IntentMatch {
   const requiredTerms = terms.filter((term) => !MODIFIER_TERMS.has(term)).slice(0, 1);
-  const modifierTerms = terms.filter((term) => !requiredTerms.includes(term));
+  const preferredTerms = terms.filter((term) => !requiredTerms.includes(term));
+  const modifierTerms = preferredTerms;
+  const lexicalTerms = preferredTerms.filter((term) => canonicalValues(term).length === 0 && !MODIFIER_TERMS.has(term));
   const matchedRequiredTerms = requiredTerms.filter((term) => termMatches(term, dish, text));
   const requiredSatisfied = requiredTerms.length === 0 || matchedRequiredTerms.length === requiredTerms.length;
-  const matchedModifierTerms = modifierTerms.filter((term) => termMatches(term, dish, text));
-  const matchedSet = new Set([...matchedRequiredTerms, ...matchedModifierTerms]);
-  const matchedTerms = requiredSatisfied ? terms.filter((term) => matchedSet.has(term)) : [];
-  const intentCoverage = requiredSatisfied && terms.length > 0 ? matchedTerms.length / terms.length : 0;
+  const matchedPreferredTerms = preferredTerms.filter((term) => termMatches(term, dish, text));
+  const matchedExcludedTerms = excludedTerms.filter((term) => termMatches(term, dish, text));
+  const excluded = matchedExcludedTerms.length > 0;
+  const matchedSet = new Set([...matchedRequiredTerms, ...matchedPreferredTerms]);
+  const matchedTerms = requiredSatisfied && !excluded ? terms.filter((term) => matchedSet.has(term)) : [];
+  const intentCoverage = calculateIntentCoverage({
+    requiredTerms,
+    preferredTerms,
+    matchedRequiredTerms,
+    matchedPreferredTerms,
+    excluded,
+  });
 
   return {
     intent,
     requiredTerms,
+    preferredTerms,
     modifierTerms,
+    lexicalTerms,
+    excludedTerms,
+    matchedExcludedTerms,
     matchedTerms,
     intentCoverage: round(intentCoverage),
-    matchedIntent: terms.length > 0 && requiredSatisfied && matchedTerms.length === terms.length,
+    matchedIntent: terms.length > 0 && requiredSatisfied && !excluded && matchedTerms.length === terms.length,
   };
 }
 
@@ -186,6 +222,7 @@ function termMatches(term: string, dish: NormalizedDish, text: string): boolean 
   if (term === "filling") return dish.heaviness >= 0.55;
   if (term === "spicy") return dish.spicy;
   if (term === "vegetarian") return dish.vegetarian;
+  if (term === "creamy") return dish.creamy;
   if (term === "fish") return dish.categories.includes("fish") || dish.proteins.some((entry) => FISH_PROTEINS.has(entry));
   if (term === "seafood") return dish.categories.includes("seafood") || dish.proteins.some((entry) => SEAFOOD_PROTEINS.has(entry));
   if (term === "meat") return dish.categories.includes("meat") || dish.proteins.some((entry) => MEAT_PROTEINS.has(entry));
@@ -205,16 +242,69 @@ function termMatches(term: string, dish: NormalizedDish, text: string): boolean 
     dish.proteins.includes(value) ||
     dish.cookingMethods.includes(value) ||
     dish.cuisines.includes(value)
-  ) || normalizeText(text).split(" ").includes(normalizeText(term));
+  ) || ` ${normalizeText(text)} `.includes(` ${normalizeText(term)} `);
 }
 
-function extractCommonModifierTerms(value: string): string[] {
+function calculateIntentCoverage(input: {
+  requiredTerms: string[];
+  preferredTerms: string[];
+  matchedRequiredTerms: string[];
+  matchedPreferredTerms: string[];
+  excluded: boolean;
+}): number {
+  if (input.excluded) return 0;
+  if (input.requiredTerms.length === 0) {
+    return input.preferredTerms.length === 0 ? 0 : input.matchedPreferredTerms.length / input.preferredTerms.length;
+  }
+  if (input.matchedRequiredTerms.length < input.requiredTerms.length) return 0;
+  if (input.preferredTerms.length === 0) return 1;
+  return 0.7 + 0.3 * (input.matchedPreferredTerms.length / input.preferredTerms.length);
+}
+
+function extractModifierTerms(value: string): string[] {
   return unique([
     ...(LIGHT.test(value) ? ["light"] : []),
     ...(FILLING.test(value) ? ["filling"] : []),
+    ...(CREAMY.test(value) ? ["creamy"] : []),
     ...(/(spicy|hot|остр\p{L}*)/iu.test(value) ? ["spicy"] : []),
     ...(/(vegetarian|vegan|plant based|вегетариан\p{L}*|веган\p{L}*)/iu.test(value) ? ["vegetarian"] : []),
   ]);
+}
+
+function extractLexicalTerms(value: string): string[] {
+  const unknownTokens = tokenize(value).filter((token) =>
+    canonicalValues(token).length === 0 && extractModifierTerms(token).length === 0
+  );
+  return unknownTokens.length > 0 ? [unknownTokens.join(" ")] : [];
+}
+
+function parseNegation(value: string): { affirmativeText: string; excludedTerms: string[] } {
+  const fragments: string[] = [];
+  let affirmativeText = value;
+  const patterns = [
+    /(^|[\s,;:])(?:без|without|avoid|avoiding|excluding|исключая)\s+([^,.;:]+)/giu,
+    /(^|[\s,;:])(?:не|not|no)(?!\s+(?:too\s+heavy|тяжел\p{L}*))\s+([^,.;:]+)/giu,
+  ];
+  for (const pattern of patterns) {
+    affirmativeText = affirmativeText.replace(pattern, (_match, prefix: string, fragment: string) => {
+      fragments.push(fragment.trim());
+      return prefix;
+    });
+  }
+  const excludedTerms = unique(fragments.flatMap((fragment) => [
+    ...canonicalValues(fragment),
+    ...extractModifierTerms(fragment),
+    ...extractLexicalTerms(fragment),
+  ]));
+  return { affirmativeText, excludedTerms };
+}
+
+function extractExcludedTerms(value: string): string[] {
+  return parseNegation(value).excludedTerms;
+}
+
+function extractCommonModifierTerms(value: string): string[] {
+  return extractModifierTerms(parseNegation(value).affirmativeText);
 }
 
 function splitAlternativePhrases(request: string): {
@@ -260,6 +350,17 @@ function splitEnumeratedConjunction(value: string): string[] {
   return allAreKnownConcepts ? parts : [value];
 }
 
+function propagateSharedRequiredTerm(alternatives: string[][]): string[][] {
+  const sharedRequired = alternatives.flatMap((terms) => terms).find((term) =>
+    !MODIFIER_TERMS.has(term) && canonicalValues(term).length > 0
+  );
+  if (!sharedRequired) return alternatives;
+  return alternatives.map((terms) => {
+    const hasRequired = terms.some((term) => !MODIFIER_TERMS.has(term) && canonicalValues(term).length > 0);
+    return hasRequired ? terms : unique([sharedRequired, ...terms]);
+  });
+}
+
 function mergePersonSegments(segments: string[]): string[] {
   const merged: string[] = [];
   for (const segment of segments) {
@@ -286,10 +387,13 @@ function hasPersonMarker(value: string): boolean {
 function stripPersonMarker(value: string, index: number): { label: string; request: string } {
   const match = value.match(PERSON_MARKER_WITH_SPACE);
   if (!match?.[1]) return { label: value || `group ${index + 1}`, request: value };
-  return { label: match[1], request: value.slice(match[0].length) };
+  return {
+    label: match[1].replace(/\s+wants?$/iu, ""),
+    request: value.slice(match[0].length),
+  };
 }
 
-const PERSON_MARKER_SOURCE = String.raw`(?:мне|нам|ему|ей|тебе|одному|другому|первому|второму|первой|второй|for\s+\p{L}+|для\s+\p{L}+|(?!(?:Хочу|Ищу|Буду)\b)[А-ЯЁ][а-яё]+(?:е|у))`;
+const PERSON_MARKER_SOURCE = String.raw`(?:[Oo]ne(?:\s+person)?(?:\s+wants?)?|[Tt]he\s+other(?:\s+person)?(?:\s+wants?)?|[Ff]irst(?:\s+person)?(?:\s+wants?)?|[Ss]econd(?:\s+person)?(?:\s+wants?)?|мне|нам|ему|ей|тебе|одному|другому|первому|второму|первой|второй|[Ff]or\s+\p{L}+|для\s+\p{L}+|(?!(?:Хочу|Ищу|Буду)\b)[А-ЯЁ][а-яё]+(?:е|у))`;
 const PERSON_MARKER = new RegExp(`^${PERSON_MARKER_SOURCE}(?=\\s|$)`, "u");
 const PERSON_MARKER_WITH_SPACE = new RegExp(`^(${PERSON_MARKER_SOURCE})\\s+`, "u");
 

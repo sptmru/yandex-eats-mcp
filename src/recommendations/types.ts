@@ -4,6 +4,7 @@ export const normalizedDishSchema = z.object({
   categories: z.array(z.string()),
   proteins: z.array(z.string()),
   cookingMethods: z.array(z.string()),
+  ingredientCookingMethods: z.array(z.string()),
   cuisines: z.array(z.string()),
   spicy: z.boolean(),
   fried: z.boolean(),
@@ -15,7 +16,11 @@ export const normalizedDishSchema = z.object({
 export const intentMatchSchema = z.object({
   intent: z.string(),
   requiredTerms: z.array(z.string()),
+  preferredTerms: z.array(z.string()),
   modifierTerms: z.array(z.string()),
+  lexicalTerms: z.array(z.string()),
+  excludedTerms: z.array(z.string()),
+  matchedExcludedTerms: z.array(z.string()),
   matchedTerms: z.array(z.string()),
   intentCoverage: z.number().min(0).max(1),
   matchedIntent: z.boolean(),
@@ -25,6 +30,7 @@ export const recommendationIntentGroupSchema = z.object({
   id: z.string(),
   label: z.string(),
   alternatives: z.array(z.array(z.string())),
+  excludedTerms: z.array(z.string()),
 });
 
 export const foodResultSchema = z.object({
@@ -68,6 +74,7 @@ export const recommendationResultSchema = z.object({
   query: z.string(),
   searchIntents: z.array(z.string()),
   intentGroups: z.array(recommendationIntentGroupSchema),
+  excludedTerms: z.array(z.string()),
   sameRestaurant: z.boolean(),
   restaurantCoverage: z.object({
     placeSlug: z.string(),
