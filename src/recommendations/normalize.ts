@@ -89,6 +89,7 @@ const METHOD_RULES: Rule[] = [
   rule("raw", "raw", "sashimi", "tartare", "carpaccio", "сырой", "сашими", "тартар", "карпаччо"),
   rule("boiled", "boiled", "poached", "варен", "варён", "отварн", "пашот"),
   rule("stewed", "stew", "braised", "тушен", "тушён"),
+  rule("smoked", "smoked", "smoke", "копчен", "копчён", "ապխտ"),
 ];
 
 const CUISINE_RULES: Rule[] = [

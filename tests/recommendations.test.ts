@@ -6,6 +6,7 @@ import type { YandexEatsClient } from "../src/eats/client.js";
 import { diversifyResults } from "../src/recommendations/diversify.js";
 import {
   evaluateIntent,
+  evaluateIntentGroup,
   expandSearchIntents,
   parseRecommendationIntentGroups,
 } from "../src/recommendations/intents.js";
@@ -175,6 +176,14 @@ describe("dish normalization", () => {
     expect(normalizeDish({ name: "Вегетарианский салат" }).vegetarian).toBe(true);
   });
 
+  it("classifies smoked separately and never treats smoked wording alone as fried", () => {
+    const smoked = normalizeDish({ name: "Поке с копчёной курицей" });
+
+    expect(smoked.cookingMethods).toContain("smoked");
+    expect(smoked.cookingMethods).not.toContain("fried");
+    expect(smoked.fried).toBe(false);
+  });
+
   it("keeps specific proteins required instead of matching on a cooking modifier alone", () => {
     const salmon = normalizeDish({ name: "Лосось на гриле" });
 
@@ -195,6 +204,63 @@ describe("dish normalization", () => {
       groups: [
         { id: "group-1", label: "Маше", alternatives: [["meat", "fried"]] },
         { id: "group-2", label: "мне", alternatives: [["fish", "light"], ["salad", "light"]] },
+      ],
+    });
+  });
+
+  it("decomposes a natural-language noun list and applies light to every alternative", () => {
+    const parsed = parseRecommendationIntentGroups(
+      "Хочу легкий, но не скучный обед: рыба, морепродукты, салат или суп...",
+    );
+
+    expect(parsed.sameRestaurant).toBe(false);
+    expect(parsed.groups).toHaveLength(1);
+    expect(parsed.groups[0]?.alternatives).toEqual([
+      ["fish", "light"],
+      ["seafood", "light"],
+      ["salad", "light"],
+      ["soup", "light"],
+    ]);
+    const salmon = normalizeDish({ name: "Стейк из лосося на гриле" });
+    const group = parsed.groups[0];
+    expect(group && evaluateIntentGroup(group, salmon, "Стейк из лосося на гриле")).toMatchObject({
+      requiredTerms: ["fish"],
+      modifierTerms: ["light"],
+      matchedTerms: ["fish", "light"],
+      intentCoverage: 1,
+      matchedIntent: true,
+    });
+  });
+
+  it.each([
+    ["рыба / морепродукты / салат", [["fish"], ["seafood"], ["salad"]]],
+    ["рыба либо суп", [["fish"], ["soup"]]],
+    ["что-нибудь из рыбы, морепродуктов и салата", [["fish"], ["seafood"], ["salad"]]],
+    ["рыба или салат с авокадо", [["fish", "авокадо"], ["salad", "авокадо"]]],
+  ])("parses alternative syntax: %s", (query, alternatives) => {
+    expect(parseRecommendationIntentGroups(query).groups[0]?.alternatives).toEqual(alternatives);
+  });
+
+  it("keeps comma-separated alternatives inside their person group", () => {
+    expect(parseRecommendationIntentGroups(
+      "На двоих в одном месте: Маше мясо, рыбу или салат, мне суп",
+    )).toMatchObject({
+      sameRestaurant: true,
+      groups: [
+        { label: "Маше", alternatives: [["meat"], ["fish"], ["salad"]] },
+        { label: "мне", alternatives: [["soup"]] },
+      ],
+    });
+  });
+
+  it("preserves implicit comma-separated groups for a same-restaurant request", () => {
+    expect(parseRecommendationIntentGroups(
+      "Из одного ресторана: жареное мясо, легкая рыба",
+    )).toMatchObject({
+      sameRestaurant: true,
+      groups: [
+        { alternatives: [["meat", "fried"]] },
+        { alternatives: [["fish", "light"]] },
       ],
     });
   });

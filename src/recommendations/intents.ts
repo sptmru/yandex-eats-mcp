@@ -38,6 +38,7 @@ const MODIFIER_TERMS = new Set([
   "raw",
   "boiled",
   "stewed",
+  "smoked",
 ]);
 
 export function expandSearchIntents(input: {
@@ -117,24 +118,24 @@ export function parseRecommendationIntentGroups(query: string): {
   const afterColon = query.includes(":") ? query.slice(query.indexOf(":") + 1) : query;
   const possibleGroups = afterColon.split(/[,;]+/u).map((entry) => entry.trim()).filter(Boolean);
   const hasPersonMarkers = possibleGroups.filter(hasPersonMarker).length >= 1 && possibleGroups.length >= 2;
-  const segments = sameRestaurant || hasPersonMarkers ? possibleGroups : [query.trim()];
+  const implicitSameRestaurantGroups = sameRestaurant && possibleGroups.length >= 2 &&
+    !/\s+(?:или|либо|or)\s+|\s*\/\s*/iu.test(afterColon);
+  const hasGroupBoundaries = hasPersonMarkers || implicitSameRestaurantGroups;
+  const segments = hasPersonMarkers
+    ? mergePersonSegments(possibleGroups)
+    : implicitSameRestaurantGroups ? possibleGroups : [afterColon.trim()];
   const groups = segments.map((segment, index) => {
     const { label, request } = stripPersonMarker(segment, index);
-    const alternatives = request
-      .split(/\s+(?:или|or)\s+|\s*\/\s*/iu)
-      .map((entry) => entry.replace(/[.?!]+$/u, "").trim())
-      .filter(Boolean);
-    const commonTerms = [
-      ...(LIGHT.test(request) ? ["light"] : []),
-      ...(FILLING.test(request) ? ["filling"] : []),
-    ];
+    const context = hasGroupBoundaries ? request : query;
+    const { alternatives, sharedQualifierTerms } = splitAlternativePhrases(request);
+    const commonTerms = extractCommonModifierTerms(context);
     return {
       id: `group-${index + 1}`,
       label,
       alternatives: alternatives.map((alternative) => {
-        const terms = extractIntentTerms(alternative).filter((term) => term !== "light" && term !== "filling");
+        const terms = extractIntentTerms(alternative).filter((term) => !commonTerms.includes(term));
         const fallback = terms.length === 0 ? tokenize(alternative).slice(0, 3) : terms;
-        return unique([...fallback, ...commonTerms]);
+        return unique([...fallback, ...sharedQualifierTerms, ...commonTerms]);
       }).filter((terms) => terms.length > 0),
     };
   }).filter((group) => group.alternatives.length > 0);
@@ -207,20 +208,90 @@ function termMatches(term: string, dish: NormalizedDish, text: string): boolean 
   ) || normalizeText(text).split(" ").includes(normalizeText(term));
 }
 
+function extractCommonModifierTerms(value: string): string[] {
+  return unique([
+    ...(LIGHT.test(value) ? ["light"] : []),
+    ...(FILLING.test(value) ? ["filling"] : []),
+    ...(/(spicy|hot|остр\p{L}*)/iu.test(value) ? ["spicy"] : []),
+    ...(/(vegetarian|vegan|plant based|вегетариан\p{L}*|веган\p{L}*)/iu.test(value) ? ["vegetarian"] : []),
+  ]);
+}
+
+function splitAlternativePhrases(request: string): {
+  alternatives: string[];
+  sharedQualifierTerms: string[];
+} {
+  const cleaned = request.replace(/[.?!]+$/u, "").trim();
+  const hasAlternativeOperator = /\s+(?:или|либо|or)\s+|\s*\/\s*/iu.test(cleaned);
+  const hasCommaList = /[,;]/u.test(cleaned);
+  let alternatives = cleaned
+    .split(/[,;]+|\s+(?:или|либо|or)\s+|\s*\/\s*/iu)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  if (hasCommaList || /(?:что(?:-?нибудь)?|что-то|something|anything)\s+(?:из|from|of)\b/iu.test(cleaned)) {
+    alternatives = alternatives.flatMap(splitEnumeratedConjunction);
+  }
+
+  const sharedQualifierTerms: string[] = [];
+  if (hasAlternativeOperator && alternatives.length > 1) {
+    const lastIndex = alternatives.length - 1;
+    const last = alternatives[lastIndex];
+    const qualifier = last?.match(/^(.*?)\s+(?:с|with)\s+(.+)$/iu);
+    if (qualifier?.[1] && qualifier[2]) {
+      const terms = extractIntentTerms(qualifier[2]);
+      const fallback = terms.length === 0 ? tokenize(qualifier[2]).slice(0, 3) : terms;
+      if (fallback.length > 0) {
+        alternatives[lastIndex] = qualifier[1].trim();
+        sharedQualifierTerms.push(...fallback);
+      }
+    }
+  }
+
+  return { alternatives: alternatives.filter(Boolean), sharedQualifierTerms: unique(sharedQualifierTerms) };
+}
+
+function splitEnumeratedConjunction(value: string): string[] {
+  const parts = value.split(/\s+(?:и|and)\s+/iu).map((entry) => entry.trim()).filter(Boolean);
+  if (parts.length < 2) return [value];
+  const allAreKnownConcepts = parts.every((part) =>
+    extractIntentTerms(part).some((term) => !MODIFIER_TERMS.has(term))
+  );
+  return allAreKnownConcepts ? parts : [value];
+}
+
+function mergePersonSegments(segments: string[]): string[] {
+  const merged: string[] = [];
+  for (const segment of segments) {
+    if (hasPersonMarker(segment) || merged.length === 0) {
+      merged.push(segment);
+      continue;
+    }
+    const lastIndex = merged.length - 1;
+    const previous = merged[lastIndex];
+    if (previous !== undefined) merged[lastIndex] = `${previous}, ${segment}`;
+  }
+  return merged;
+}
+
 function intentKey(value: string): string {
   const terms = extractIntentTerms(value);
   return terms.length > 0 ? [...terms].sort().join("|") : normalizeText(value);
 }
 
 function hasPersonMarker(value: string): boolean {
-  return /^(?:мне|нам|ему|ей|тебе|для\s+\p{L}+|[А-ЯЁ][а-яё]+(?:е|у))(?=\s|$)/u.test(value);
+  return PERSON_MARKER.test(value);
 }
 
 function stripPersonMarker(value: string, index: number): { label: string; request: string } {
-  const match = value.match(/^(мне|нам|ему|ей|тебе|для\s+\p{L}+|[А-ЯЁ][а-яё]+(?:е|у))\s+/u);
+  const match = value.match(PERSON_MARKER_WITH_SPACE);
   if (!match?.[1]) return { label: value || `group ${index + 1}`, request: value };
   return { label: match[1], request: value.slice(match[0].length) };
 }
+
+const PERSON_MARKER_SOURCE = String.raw`(?:мне|нам|ему|ей|тебе|одному|другому|первому|второму|первой|второй|for\s+\p{L}+|для\s+\p{L}+|(?!(?:Хочу|Ищу|Буду)\b)[А-ЯЁ][а-яё]+(?:е|у))`;
+const PERSON_MARKER = new RegExp(`^${PERSON_MARKER_SOURCE}(?=\\s|$)`, "u");
+const PERSON_MARKER_WITH_SPACE = new RegExp(`^(${PERSON_MARKER_SOURCE})\\s+`, "u");
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
