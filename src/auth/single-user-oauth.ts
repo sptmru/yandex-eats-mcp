@@ -461,7 +461,7 @@ function renderApprovalPage(pendingId: string, clientName: string): string {
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Yandex Eats MCP</title>
 <style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:10vh auto;padding:1.5rem;color:#18181b}label,input,button{display:block;width:100%;box-sizing:border-box}input,button{font:inherit;padding:.8rem;margin-top:.5rem}button{margin-top:1rem;background:#111827;color:white;border:0;border-radius:.4rem}small{color:#52525b}</style></head>
 <body><h1>Authorize Yandex Eats MCP</h1><p><strong>${escapeHtml(clientName)}</strong> is requesting access to the private food-ordering tools on this server.</p>
-<p><small>This grants search and cart access. Final checkout and order placement are disabled.</small></p>
+<p><small>This grants search, recommendation, preference, order-status, and cart access. Final checkout and order placement are disabled.</small></p>
 <form method="post" action="/oauth/approve"><input type="hidden" name="pending" value="${escapeHtml(pendingId)}"><label>Owner password<input type="password" name="password" autocomplete="current-password" required></label><button type="submit">Authorize</button></form></body></html>`;
 }
 

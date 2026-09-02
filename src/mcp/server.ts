@@ -11,9 +11,17 @@ import {
   normalizedPlaceSchema,
   normalizedSearchSchema,
 } from "../eats/schemas.js";
-import { toPublicError } from "./errors.js";
+import { EatsError, toPublicError } from "./errors.js";
 import { createInactiveOrderMonitorService, type OrderMonitorService } from "../orders/order-monitor.js";
 import { normalizedOrderStatusSchema, orderEventSchema } from "../orders/types.js";
+import { FoodPreferenceStore } from "../recommendations/preferences-store.js";
+import { RecommendationService } from "../recommendations/service.js";
+import {
+  foodPreferenceSchema,
+  foodPreferencesResultSchema,
+  foodSearchResultSchema,
+  recommendationResultSchema,
+} from "../recommendations/types.js";
 
 const errorSchema = {
   code: z.string(),
@@ -40,12 +48,17 @@ export function createYandexEatsMcpServer(
   config: AppConfig,
   logger: Logger,
   orderMonitor: OrderMonitorService = createInactiveOrderMonitorService(config),
+  recommendationService: RecommendationService = new RecommendationService(
+    client,
+    new FoodPreferenceStore(config.stateDir, logger),
+    logger,
+  ),
 ): McpServer {
   const server = new McpServer(
-    { name: "yandex-eats-mcp", version: "0.1.0" },
+    { name: "yandex-eats-mcp", version: "0.2.0" },
     {
       instructions:
-        "Search, order monitoring, and other read tools may run automatically. To consume order changes, call get_order_events with the last nextSequence cursor; the MCP cannot initiate a message in a sleeping ChatGPT conversation. Cart mutations require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Items marked adult may be added to the cart; any eligibility or age-verification requirements remain enforced by Yandex Eats. Pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
+        "Use recommend_food for natural-language food discovery and search_items for verified multi-query item search; both confirm matches against current menus and return explainable scores. Search, recommendations, order monitoring, and other read tools may run automatically. To consume order changes, call get_order_events with the last nextSequence cursor; the MCP cannot initiate a message in a sleeping ChatGPT conversation. Cart mutations and preference writes require the user's explicit request. Before add_to_cart, inspect get_menu and never guess required options. Never remove or replace items as an optimization. Items marked adult may be added to the cart; any eligibility or age-verification requirements remain enforced by Yandex Eats. Pickup, SKU carts, checkout, and place_order are unsupported. A mutation result contains a fresh server cart snapshot; after an ambiguous mutation error, call get_cart to reconcile.",
     },
   );
 
@@ -121,6 +134,107 @@ export function createYandexEatsMcpServer(
     },
     async ({ placeSlug }) => toolCall(logger, "get_place", () => client.getPlace(placeSlug), (value) =>
       `${value.name} is ${value.available ? "available" : "unavailable"}.`,
+    ),
+  );
+
+  server.registerTool(
+    "search_items",
+    {
+      title: "Search verified Yandex Eats menu items",
+      description:
+        "Run several related searches, deduplicate places/items across queries and pagination, load current menus, and return only actual matching available items.",
+      inputSchema: {
+        queries: z.array(z.string().trim().min(1).max(200)).min(1).max(8),
+        maxPlaces: z.number().int().min(1).max(12).optional(),
+        maxItems: z.number().int().min(1).max(100).optional(),
+        maxPagesPerQuery: z.number().int().min(1).max(2).optional(),
+        deduplicate: z.boolean().default(true),
+      },
+      outputSchema: foodSearchResultSchema.shape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    async (input) => toolCall(
+      logger,
+      "search_items",
+      () => recommendationService.searchItems(compactOptional(input)),
+      (value) => `Found ${value.results.length} verified menu items from ${value.menusLoaded} menus.`,
+    ),
+  );
+
+  server.registerTool(
+    "recommend_food",
+    {
+      title: "Recommend Yandex Eats dishes",
+      description:
+        "Recommend current menu items for a natural-language request using deterministic multilingual normalization, preference/price/heaviness scoring, and diversity-aware selection.",
+      inputSchema: {
+        query: z.string().trim().min(1).max(500),
+        categories: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+        prefer: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+        avoid: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+        maxPrice: z.number().nonnegative().optional(),
+        maxHeaviness: z.number().min(0).max(1).optional(),
+        maxPerRestaurant: z.number().int().min(1).max(10).default(2),
+        maxPerCategory: z.number().int().min(1).max(10).default(2),
+        exploration: z.number().min(0).max(1).default(0.35),
+        limit: z.number().int().min(1).max(30).default(10),
+      },
+      outputSchema: recommendationResultSchema.shape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    async (input) => toolCall(
+      logger,
+      "recommend_food",
+      () => recommendationService.recommend(compactOptional(input)),
+      (value) => `Recommended ${value.results.length} diverse dishes from ${value.menusLoaded} current menus.`,
+    ),
+  );
+
+  server.registerTool(
+    "record_food_feedback",
+    {
+      title: "Record food preference feedback",
+      description:
+        "Persist an explicit like, dislike, order, or 1-5 rating for a restaurant or menu item. Call only when the user explicitly supplies the signal.",
+      inputSchema: {
+        placeSlug: z.string().trim().min(1).max(300),
+        placeName: z.string().trim().min(1).max(300).optional(),
+        itemId: z.union([z.string(), z.number()]).transform(String).optional(),
+        itemName: z.string().trim().min(1).max(300).optional(),
+        signal: z.enum(["liked", "disliked", "ordered", "rated"]),
+        rating: z.number().int().min(1).max(5).optional(),
+        orderedAt: z.string().datetime().optional(),
+      },
+      outputSchema: { preference: foodPreferenceSchema },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    },
+    async (input) => toolCall(
+      logger,
+      "record_food_feedback",
+      async () => {
+        if (input.signal === "rated" && input.rating === undefined) {
+          throw new EatsError("VALIDATION_ERROR", "rating is required when signal is rated");
+        }
+        return { preference: await recommendationService.recordFeedback(compactOptional(input)) };
+      },
+      () => "Food preference feedback recorded.",
+    ),
+  );
+
+  server.registerTool(
+    "get_food_preferences",
+    {
+      title: "Get food preferences",
+      description: "Return the explicit restaurant/item likes, dislikes, ratings, and order counts stored by this personal MCP.",
+      inputSchema: {},
+      outputSchema: foodPreferencesResultSchema.shape,
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    },
+    async () => toolCall(
+      logger,
+      "get_food_preferences",
+      () => recommendationService.getPreferences(),
+      (value) => `Loaded ${value.preferences.length} food preference records.`,
     ),
   );
 
@@ -363,6 +477,8 @@ export function createYandexEatsMcpServer(
         orderEventJournalEnabled: z.literal(true),
         orderNotifier: z.enum(["none", "telegram"]),
         chatgptDirectPushSupported: z.literal(false),
+        foodRecommendationsSupported: z.literal(true),
+        foodPreferencesSupported: z.literal(true),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -381,6 +497,8 @@ export function createYandexEatsMcpServer(
           orderEventJournalEnabled: true as const,
           orderNotifier: orderMonitor.getNotifierProvider(),
           chatgptDirectPushSupported: false as const,
+          foodRecommendationsSupported: true as const,
+          foodPreferencesSupported: true as const,
         }),
         (value) => `Cart mutations are ${value.cartMutationsEnabled ? "enabled" : "disabled"}; checkout is disabled.`,
       ),

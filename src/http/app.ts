@@ -13,6 +13,8 @@ import type { YandexEatsClient } from "../eats/client.js";
 import { createYandexEatsMcpServer } from "../mcp/server.js";
 import { SingleUserOAuthProvider, StaticBearerVerifier } from "../auth/single-user-oauth.js";
 import { createInactiveOrderMonitorService, type OrderMonitorService } from "../orders/order-monitor.js";
+import { FoodPreferenceStore } from "../recommendations/preferences-store.js";
+import { RecommendationService } from "../recommendations/service.js";
 
 export async function createHttpApp(
   config: AppConfig,
@@ -56,6 +58,12 @@ export async function createHttpApp(
   });
 
   const authMiddleware = await configureAuth(app, config, logger);
+  const recommendationService = new RecommendationService(
+    client,
+    new FoodPreferenceStore(config.stateDir, logger),
+    logger,
+  );
+  await recommendationService.initialize();
 
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ status: "ok" });
@@ -73,7 +81,7 @@ export async function createHttpApp(
   app.get("/", (_req, res) => {
     res.status(200).json({
       name: "yandex-eats-mcp",
-      version: "0.1.0",
+      version: "0.2.0",
       mcp: "/mcp",
       checkoutEnabled: false,
       placeOrderEnabled: false,
@@ -81,7 +89,7 @@ export async function createHttpApp(
   });
 
   app.post("/mcp", authMiddleware, async (req, res) => {
-    const server = createYandexEatsMcpServer(client, config, logger, orderMonitor);
+    const server = createYandexEatsMcpServer(client, config, logger, orderMonitor, recommendationService);
     const transport = new StreamableHTTPServerTransport();
     try {
       await server.connect(transport as unknown as Transport);

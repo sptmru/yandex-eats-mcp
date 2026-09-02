@@ -43,6 +43,10 @@ describe("MCP contract", () => {
         "get_delivery_context",
         "search",
         "get_place",
+        "search_items",
+        "recommend_food",
+        "record_food_feedback",
+        "get_food_preferences",
         "get_menu",
         "get_cart",
         "get_active_orders",
@@ -68,9 +72,27 @@ describe("MCP contract", () => {
         orderEventJournalEnabled: true,
         orderNotifier: "none",
         chatgptDirectPushSupported: false,
+        foodRecommendationsSupported: true,
+        foodPreferencesSupported: true,
       });
       const events = listed.tools.find((tool) => tool.name === "get_order_events");
       expect(events?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
+      const recommendations = listed.tools.find((tool) => tool.name === "recommend_food");
+      expect(recommendations?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
+      const feedback = listed.tools.find((tool) => tool.name === "record_food_feedback");
+      expect(feedback?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: false });
+
+      const recorded = await mcpClient.callTool({
+        name: "record_food_feedback",
+        arguments: { placeSlug: "test-cafe", itemId: "dish-1", signal: "liked" },
+      });
+      expect(recorded.structuredContent).toMatchObject({
+        preference: { placeSlug: "test-cafe", itemId: "dish-1", liked: true, orderCount: 0 },
+      });
+      const preferences = await mcpClient.callTool({ name: "get_food_preferences", arguments: {} });
+      expect(preferences.structuredContent).toMatchObject({
+        preferences: [{ placeSlug: "test-cafe", itemId: "dish-1", liked: true }],
+      });
     } finally {
       await mcpClient.close();
       await server.close();

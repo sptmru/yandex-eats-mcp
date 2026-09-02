@@ -1,6 +1,6 @@
 {
   "name": "yandex-eats-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Single-user Streamable HTTP MCP server for the Yandex Eats private web API",

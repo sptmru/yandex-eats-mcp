@@ -5,6 +5,9 @@ Single-user Streamable HTTP MCP server for ChatGPT. It talks directly to the pri
 Current release:
 
 - searches restaurants and matching items near one server-configured delivery point;
+- verifies multi-query matches against current menus and produces diverse, explainable food recommendations;
+- normalizes dish categories, proteins, cooking methods, cuisines, dietary signals, and heuristic heaviness in Russian and English;
+- stores explicit likes, dislikes, ratings, and order counts in the private state volume;
 - loads restaurant availability and complete menus;
 - lists and reads server-side carts;
 - monitors active orders with server-directed polling, a persistent event cursor, and optional Telegram delivery;
@@ -36,6 +39,10 @@ https://eats.yandex.com
 ```
 
 The process-level `OrderMonitor` is independent of MCP request sessions. It polls Yandex's read-only order endpoints, writes sanitized state to `/app/state/order-monitor-state.json`, appends cursor-addressable events to `/app/state/order-events.jsonl`, and optionally sends a minimal Telegram message.
+
+The recommendation layer is independent of the private-API mappers. It expands a natural-language request into a bounded set of search intents, deduplicates restaurant candidates across searches and pagination, loads up to 12 current menus with concurrency limited to 3, and keeps only matching available items. Deterministic normalization and scoring run locally; no LLM or external recommendation service is called. Final selection combines score, restaurant/category quotas, and an MMR-like similarity penalty.
+
+Explicit food preferences are stored atomically in `/app/state/food-preferences.json`. Automatic order-history import is intentionally not enabled: Yandex can return historical order shells without stable menu-item metadata, so the server only records signals explicitly supplied through `record_food_feedback`.
 
 An MCP server cannot initiate a message in a sleeping ChatGPT conversation. ChatGPT can call `get_order_events` periodically (for example from a Scheduled Task), while Telegram provides the near-real-time push channel.
 
@@ -155,7 +162,7 @@ Cloudflare Tunnel makes the origin reachable; the MCP OAuth flow is still the ap
 4. Enter the value from `secrets/mcp_oauth_password`. This is the MCP owner password, not a Yandex password.
 5. Review the tool list. `remove_cart_item` is destructive; checkout and order placement should not appear.
 
-The OAuth owner page explicitly states that it grants search/cart access only.
+The OAuth owner page explicitly states that it grants search, recommendation, preference, order-status, and cart access. Checkout and order placement remain disabled.
 
 ## Tools
 
@@ -165,6 +172,10 @@ The OAuth owner page explicitly states that it grants search/cart access only.
 | `get_delivery_context` | No | City/label only, never exact coordinates |
 | `search` | No | Full-text search with opaque cursor |
 | `get_place` | No | Availability and ETA |
+| `search_items` | No | Multi-query, multi-page item search verified against current menus |
+| `recommend_food` | No | Explainable scoring plus restaurant/category diversification |
+| `record_food_feedback` | Yes, local preference state | Explicit likes, dislikes, ratings, and order counts only |
+| `get_food_preferences` | No | Reads locally persisted preference signals |
 | `get_menu` | No | Optional local query/category filtering |
 | `get_cart` | No | Lists carts or loads one fresh cart |
 | `get_active_orders` | No | Sanitized cached active orders and monitor health |
@@ -178,6 +189,41 @@ The OAuth owner page explicitly states that it grants search/cart access only.
 Every mutation accepts an optional UUID `operationId`; repeating the same operation within ten minutes returns the same in-process result instead of repeating the upstream mutation. Reusing the ID with different arguments is rejected. Unsafe upstream requests are never automatically retried. If the response is lost or times out, the tool returns `MUTATION_STATUS_UNKNOWN`; call `get_cart` to reconcile.
 
 After any successful mutation, the MCP reloads and returns the server cart. Budget checks must use that fresh total and its violated constraints, not a local sum.
+
+## Food recommendations
+
+`recommend_food` accepts a natural-language `query` together with optional structured constraints:
+
+```json
+{
+  "query": "light lunch, fish / salad / seafood / soup, give me 10 varied options",
+  "categories": ["fish", "salad", "seafood", "soup"],
+  "prefer": ["grilled", "vegetables"],
+  "avoid": ["deep fried", "creamy"],
+  "maxPrice": 5000,
+  "maxHeaviness": 0.65,
+  "maxPerRestaurant": 2,
+  "maxPerCategory": 2,
+  "exploration": 0.6,
+  "limit": 10
+}
+```
+
+Each result includes restaurant metadata, item ID/name/description/price/weight, an optional translated `searchName` from Yandex's search projection, normalized food attributes, a 0..1 score, and concise `scoreReasons`. Search item IDs are joined back to full-menu item IDs, so a translated search hit can verify a menu item even when the restaurant publishes its full menu in another language. `heaviness` is an inspectable recommendation heuristic based on dish wording, preparation, sauce, category, and stated weight. It is not nutritional or medical data.
+
+For an explicit multi-query search without preference-aware ranking, use:
+
+```json
+{
+  "queries": ["fish", "seafood", "soup", "salad", "poke"],
+  "maxPlaces": 12,
+  "maxItems": 50,
+  "maxPagesPerQuery": 2,
+  "deduplicate": true
+}
+```
+
+The ordinary `search` tool remains backward-compatible and exposes Yandex's fast search projection. Use `search_items` or `recommend_food` when a menu-level match is required. Recommendation calls are slower and consume more upstream requests because they verify full menus. Ratings, delivery fees, rating counts, and similar fields are returned only when the relevant Yandex response actually exposes them.
 
 ## Order monitoring and Telegram
 
@@ -237,7 +283,7 @@ docker compose config
 docker compose build
 ```
 
-The normal test suite uses sanitized fixtures and mocked upstream responses. It verifies mapper tolerance, exact request wiring, no retry for ambiguous mutations, mutation serialization/idempotency, auth persistence, and MCP tool annotations.
+The normal test suite uses sanitized fixtures and mocked upstream responses. It verifies mapper tolerance, exact request wiring, recommendation normalization/scoring/deduplication/diversification, preference persistence, no retry for ambiguous mutations, mutation serialization/idempotency, auth persistence, and MCP tool annotations.
 
 Read-only live contract tests are opt-in and require your local cookie and coordinates:
 
