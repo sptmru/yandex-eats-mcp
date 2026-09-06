@@ -9,12 +9,14 @@ import type { NormalizedOrderStatus, OrderEvent, OrderEventPage, OrderEventType,
 import type { OrderNotifierQueue } from "./notifiers/queue.js";
 
 export interface OrderApi {
-  listOrders(source?: string): Promise<RawOrdersEnvelope>;
-  refreshOrders(orderNrs: string[]): Promise<RawOrdersEnvelope>;
-  getDesktopTracking(orderNr: string): Promise<RawTrackingEnvelope>;
+  listOrders(source?: string, signal?: AbortSignal): Promise<RawOrdersEnvelope>;
+  refreshOrders(orderNrs: string[], signal?: AbortSignal): Promise<RawOrdersEnvelope>;
+  getDesktopTracking(orderNr: string, signal?: AbortSignal): Promise<RawTrackingEnvelope>;
 }
 
-type TrackingController = { timer?: NodeJS.Timeout; inFlight: boolean };
+type TrackingController = { timer?: NodeJS.Timeout };
+type PollHealth = { lastSuccessAt?: number; failures: number; authExpired: boolean };
+const emptyHealth = (): PollHealth => ({ failures: 0, authExpired: false });
 
 export interface OrderMonitorService {
   getHealth(): OrderMonitorHealth;
@@ -27,7 +29,9 @@ export function createInactiveOrderMonitorService(config: AppConfig): OrderMonit
   return {
     getHealth: () => ({
       monitorEnabled: config.orders.enabled,
-      monitorHealthy: true,
+      monitorHealthy: !config.orders.enabled,
+      listHealthy: false,
+      trackingHealthy: true,
       authExpired: false,
       orders: [],
     }),
@@ -40,13 +44,19 @@ export function createInactiveOrderMonitorService(config: AppConfig): OrderMonit
 export class OrderMonitor {
   private readonly store: OrderStateStore;
   private running = false;
+  private stopped = false;
+  private shutdown = new AbortController();
   private listTimer: NodeJS.Timeout | undefined;
+  private listTask: Promise<void> | undefined;
+  private trackingTasks = new Map<string, Promise<void>>();
   private activeOrderNrs = new Set<string>();
   private tracking = new Map<string, TrackingController>();
   private terminalGraceRemaining = new Map<string, number>();
   private listIntervalMs: number;
   private lastFullDiscoveryAt = 0;
-  private consecutiveFailures = 0;
+  private listHealth: PollHealth = emptyHealth();
+  private trackingHealth = new Map<string, PollHealth>();
+  private healthUpdates: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly api: OrderApi,
@@ -61,35 +71,44 @@ export class OrderMonitor {
       config.orders.eventRetentionDays,
       config.orders.eventMaxCount,
       logger,
+      notifierProvider,
     );
     this.listIntervalMs = config.orders.pollMaxMs;
   }
 
   async initialize(): Promise<void> {
     await this.store.initialize();
+    this.notifierQueue.attachOutbox(this.store);
   }
 
   async start(): Promise<void> {
     if (!this.config.orders.enabled || this.running) return;
     this.running = true;
+    this.stopped = false;
+    if (this.shutdown.signal.aborted) this.shutdown = new AbortController();
+    this.notifierQueue.start();
     try {
       await this.pollNow();
     } catch (error) {
-      await this.handlePollFailure(error);
+      // Each component records its own failure; list success cannot reset it.
+      if (!this.stopped) this.logger.warn({ errorCode: errorCode(error) }, "Order monitor startup poll failed");
     }
-    if (this.running && !this.listTimer) this.scheduleList(this.nextErrorOrListDelay());
+    if (this.running && !this.listTimer) this.scheduleList(this.nextDelay(this.listHealth));
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    this.stopped = true;
+    this.shutdown.abort();
     if (this.listTimer) clearTimeout(this.listTimer);
     this.listTimer = undefined;
     for (const controller of this.tracking.values()) {
       if (controller.timer) clearTimeout(controller.timer);
     }
+    await Promise.allSettled([this.listTask, ...this.trackingTasks.values(), this.notifierQueue.stop()]);
     this.tracking.clear();
     this.terminalGraceRemaining.clear();
-    await this.notifierQueue.stop();
+    await this.healthUpdates;
     await this.store.flush();
   }
 
@@ -98,36 +117,62 @@ export class OrderMonitor {
     if (this.listTimer) clearTimeout(this.listTimer);
     this.listTimer = undefined;
     this.scheduleList(0);
+    for (const orderNr of this.activeOrderNrs) this.scheduleTracking(orderNr, 0);
+    this.notifierQueue.wake();
   }
 
-  async pollNow(): Promise<void> {
+  pollNow(): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("Order monitor is stopped"));
+    this.listTask ??= this.pollList().finally(() => { this.listTask = undefined; });
+    return this.listTask;
+  }
+
+  private async pollList(): Promise<void> {
     const baseline = !this.store.isInitialized();
+    const firstPoll = this.listHealth.lastSuccessAt === undefined;
     const useRefresh = !baseline && this.activeOrderNrs.size > 0 &&
       Date.now() - this.lastFullDiscoveryAt < this.config.orders.pollMaxMs;
-    const envelope = useRefresh
-      ? await this.api.refreshOrders([...this.activeOrderNrs])
-      : await this.api.listOrders();
-    if (!useRefresh) this.lastFullDiscoveryAt = Date.now();
-    await this.processOrdersEnvelope(envelope);
-    if (baseline) {
-      for (const orderNr of this.activeOrderNrs) await this.pollTracking(orderNr, true);
-      await this.store.markInitialized();
-      if (this.running) this.syncTrackingLoops();
-    } else if (!this.running) {
-      for (const orderNr of this.activeOrderNrs) await this.pollTracking(orderNr, false);
+    try {
+      const envelope = useRefresh
+        ? await this.api.refreshOrders([...this.activeOrderNrs], this.shutdown.signal)
+        : await this.api.listOrders(undefined, this.shutdown.signal);
+      this.shutdown.signal.throwIfAborted();
+      if (!useRefresh) this.lastFullDiscoveryAt = Date.now();
+      await this.processOrdersEnvelope(envelope);
+      this.listHealth = { lastSuccessAt: Date.now(), failures: 0, authExpired: false };
+    } catch (error) {
+      if (!this.shutdown.signal.aborted) await this.handlePollFailure(error, this.listHealth);
+      throw error;
     }
-    await this.markRecovered();
-    this.consecutiveFailures = 0;
-    await this.store.markPollSucceeded(new Date().toISOString());
+    const results = baseline || firstPoll || !this.running
+      ? await Promise.allSettled([...this.activeOrderNrs].map((orderNr) => this.pollTracking(orderNr, baseline)))
+      : [];
+    try {
+      await this.reconcileHealth();
+    } catch (error) {
+      await this.handlePollFailure(error, this.listHealth);
+      throw error;
+    }
+    if (this.running) this.syncTrackingLoops();
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   getHealth(): OrderMonitorHealth {
     const lastSuccessfulPollAt = this.store.getLastSuccessfulPollAt();
+    const listHealthy = this.isFresh(this.listHealth);
+    const trackingHealthy = this.requiredTrackingHealth().every((health) => this.isFresh(health));
     return {
       monitorEnabled: this.config.orders.enabled,
-      monitorHealthy: !this.config.orders.enabled || (!this.store.getAuthExpired() && this.consecutiveFailures === 0),
-      authExpired: this.store.getAuthExpired(),
+      monitorHealthy: !this.config.orders.enabled || (!this.stopped && this.store.isInitialized() &&
+        !this.store.getAuthExpired() && listHealthy && trackingHealthy),
+      listHealthy,
+      trackingHealthy,
+      authExpired: this.store.getAuthExpired() || this.listHealth.authExpired ||
+        this.requiredTrackingHealth().some((health) => health.authExpired),
       ...(lastSuccessfulPollAt ? { lastSuccessfulPollAt } : {}),
+      ...(this.listHealth.lastSuccessAt !== undefined
+        ? { lastSuccessfulListPollAt: new Date(this.listHealth.lastSuccessAt).toISOString() } : {}),
       orders: this.store.getSnapshots().filter((order) => this.activeOrderNrs.has(order.orderNr) && !order.terminal),
     };
   }
@@ -161,43 +206,56 @@ export class OrderMonitor {
     this.activeOrderNrs = nextActive;
     for (const orderNr of [...this.activeOrderNrs]) {
       if (this.store.getSnapshot(orderNr)?.terminal) this.activeOrderNrs.delete(orderNr);
+      else if (!this.trackingHealth.has(orderNr)) this.trackingHealth.set(orderNr, emptyHealth());
+    }
+    for (const orderNr of this.trackingHealth.keys()) {
+      if (!this.activeOrderNrs.has(orderNr) && !this.tracking.has(orderNr)) this.trackingHealth.delete(orderNr);
     }
     await this.store.pruneInactiveSnapshots(new Set([...this.activeOrderNrs, ...previousActive]));
     this.listIntervalMs = this.clampInterval((envelope.update_settings?.update_period ?? 10) * 1_000);
-    if (this.running && this.store.isInitialized()) this.syncTrackingLoops();
   }
 
-  private async pollTracking(orderNr: string, baseline: boolean): Promise<void> {
-    const controller = this.tracking.get(orderNr);
-    if (controller?.inFlight) return;
-    if (controller) controller.inFlight = true;
+  private pollTracking(orderNr: string, baseline: boolean): Promise<void> {
+    if (this.stopped) return Promise.reject(new Error("Order monitor is stopped"));
+    const current = this.trackingTasks.get(orderNr);
+    if (current) return current;
+    const task = this.performTracking(orderNr, baseline).finally(() => { this.trackingTasks.delete(orderNr); });
+    this.trackingTasks.set(orderNr, task);
+    return task;
+  }
+
+  private async performTracking(orderNr: string, baseline: boolean): Promise<void> {
+    const health = this.trackingHealth.get(orderNr) ?? emptyHealth();
+    this.trackingHealth.set(orderNr, health);
     try {
-      const envelope = await this.api.getDesktopTracking(orderNr);
+      const envelope = await this.api.getDesktopTracking(orderNr, this.shutdown.signal);
+      this.shutdown.signal.throwIfAborted();
       const status = normalizeOrderStatus(envelope.tracked_order, orderNr);
-      if (status) await this.processStatus(status, baseline);
-      await this.markRecovered();
-      this.consecutiveFailures = 0;
-      await this.store.markPollSucceeded(new Date().toISOString());
-      if (this.running && !status?.terminal && this.shouldContinueTracking(orderNr)) {
-        this.scheduleTracking(orderNr, this.clampInterval((envelope.polling_policy?.full_update_after ?? 10) * 1_000));
-      } else if (status?.terminal) {
+      if (!status) throw new EatsError("UPSTREAM_BAD_RESPONSE", "Desktop tracking did not contain an order status");
+      await this.processStatus(status, baseline);
+      Object.assign(health, { lastSuccessAt: Date.now(), failures: 0, authExpired: false });
+      if (status.terminal) {
+        this.activeOrderNrs.delete(orderNr);
         this.removeTracking(orderNr);
+      } else if (this.running && this.shouldContinueTracking(orderNr)) {
+        this.scheduleTracking(orderNr, this.clampInterval((envelope.polling_policy?.full_update_after ?? 10) * 1_000));
       } else if (!this.activeOrderNrs.has(orderNr)) {
         this.removeTracking(orderNr);
       }
+      await this.reconcileHealth();
     } catch (error) {
+      if (this.shutdown.signal.aborted) throw error;
       if (isTrackingNotFound(error)) {
+        this.activeOrderNrs.delete(orderNr);
         this.removeTracking(orderNr);
+        await this.reconcileHealth();
         this.logger.debug({ orderRef: orderNr.slice(-4) }, "Order is no longer available for desktop tracking");
         return;
       }
-      await this.handlePollFailure(error);
-      if (this.running && this.shouldContinueTracking(orderNr)) this.scheduleTracking(orderNr, this.nextErrorOrListDelay());
+      await this.handlePollFailure(error, health);
+      if (this.running && this.shouldContinueTracking(orderNr)) this.scheduleTracking(orderNr, this.nextDelay(health));
       else if (!this.activeOrderNrs.has(orderNr)) this.removeTracking(orderNr);
-      if (!this.running) throw error;
-    } finally {
-      const current = this.tracking.get(orderNr);
-      if (current) current.inFlight = false;
+      throw error;
     }
   }
 
@@ -234,23 +292,24 @@ export class OrderMonitor {
     previous?: NormalizedOrderStatus;
     current?: NormalizedOrderStatus;
   }): Promise<OrderEvent | undefined> {
-    const event = await this.store.commitEvent(input);
-    if (!event) return undefined;
-    this.notifierQueue.enqueue(event);
-    this.logger.info(
-      { eventId: event.id, eventType: event.type, orderRef: event.orderNr ? event.orderNr.slice(-4) : undefined },
-      "Order monitor event recorded",
-    );
-    return event;
+    try {
+      const event = await this.store.commitEvent(input);
+      if (!event) return undefined;
+      this.logger.info(
+        { eventId: event.id, eventType: event.type, orderRef: event.orderNr ? event.orderNr.slice(-4) : undefined },
+        "Order monitor event recorded",
+      );
+      return event;
+    } finally {
+      // Also drain an append that succeeded before a later snapshot write failed.
+      this.notifierQueue.wake();
+    }
   }
 
   private syncTrackingLoops(): void {
     for (const orderNr of this.activeOrderNrs) {
       this.terminalGraceRemaining.delete(orderNr);
-      if (!this.tracking.has(orderNr)) {
-        this.tracking.set(orderNr, { inFlight: false });
-        this.scheduleTracking(orderNr, 0);
-      }
+      if (!this.tracking.has(orderNr)) this.scheduleTracking(orderNr, 0);
     }
     for (const orderNr of this.tracking.keys()) {
       if (!this.activeOrderNrs.has(orderNr) && !this.terminalGraceRemaining.has(orderNr)) {
@@ -264,6 +323,7 @@ export class OrderMonitor {
     const controller = this.tracking.get(orderNr);
     if (controller?.timer) clearTimeout(controller.timer);
     this.tracking.delete(orderNr);
+    this.trackingHealth.delete(orderNr);
     this.terminalGraceRemaining.delete(orderNr);
   }
 
@@ -279,51 +339,75 @@ export class OrderMonitor {
     if (!this.running || this.listTimer) return;
     this.listTimer = setTimeout(() => {
       this.listTimer = undefined;
-      void this.pollNow()
-        .catch((error: unknown) => this.handlePollFailure(error))
-        .finally(() => {
-          if (this.running) this.scheduleList(this.nextErrorOrListDelay());
-        });
+      void this.pollNow().catch(() => {
+        this.logger.debug("Scheduled order list poll failed");
+      }).finally(() => {
+        if (this.running) this.scheduleList(this.nextDelay(this.listHealth));
+      });
     }, this.withJitter(delayMs));
     this.listTimer.unref();
   }
 
   private scheduleTracking(orderNr: string, delayMs: number): void {
     if (!this.running) return;
-    const controller = this.tracking.get(orderNr) ?? { inFlight: false };
+    const controller = this.tracking.get(orderNr) ?? {};
     if (controller.timer) clearTimeout(controller.timer);
     controller.timer = setTimeout(() => {
       delete controller.timer;
-      void this.pollTracking(orderNr, false);
+      void this.pollTracking(orderNr, !this.store.isInitialized()).catch(() => {
+        this.logger.debug({ orderRef: orderNr.slice(-4) }, "Scheduled order tracking poll failed");
+      });
     }, this.withJitter(delayMs));
     controller.timer.unref();
     this.tracking.set(orderNr, controller);
   }
 
-  private async handlePollFailure(error: unknown): Promise<void> {
-    this.consecutiveFailures += 1;
-    if (isAuthExpired(error) && !this.store.getAuthExpired()) {
-      await this.store.setAuthExpired(true);
-      await this.emitEvent({
-        type: "monitor.auth_expired",
-        summary: "Yandex Eats authentication expired. Refresh the cookie secret.",
-      });
+  private async handlePollFailure(error: unknown, health: PollHealth): Promise<void> {
+    health.failures += 1;
+    health.authExpired ||= isAuthExpired(error);
+    try {
+      await this.reconcileHealth();
+    } finally {
+      this.logger.warn(
+        { errorCode: errorCode(error), consecutiveFailures: health.failures },
+        "Order monitor poll failed",
+      );
     }
-    this.logger.warn(
-      { errorCode: errorCode(error), consecutiveFailures: this.consecutiveFailures },
-      "Order monitor poll failed",
-    );
   }
 
-  private async markRecovered(): Promise<void> {
-    if (!this.store.getAuthExpired()) return;
-    await this.store.setAuthExpired(false);
-    await this.emitEvent({ type: "monitor.recovered", summary: "Yandex Eats order monitoring recovered." });
+  private reconcileHealth(): Promise<void> {
+    const next = this.healthUpdates.then(async () => {
+      if (this.stopped) return;
+      const tracking = this.requiredTrackingHealth();
+      const authExpired = this.listHealth.authExpired || tracking.some((health) => health.authExpired);
+      if (authExpired && !this.store.getAuthExpired()) {
+        await this.emitEvent({ type: "monitor.auth_expired", summary: "Yandex Eats authentication expired. Refresh the cookie secret." });
+      }
+      if (!this.isFresh(this.listHealth) || !tracking.every((health) => this.isFresh(health))) return;
+      if (!this.store.isInitialized()) await this.store.markInitialized();
+      if (this.store.getAuthExpired()) {
+        await this.emitEvent({ type: "monitor.recovered", summary: "Yandex Eats order monitoring recovered." });
+      }
+      await this.store.markPollSucceeded(new Date().toISOString());
+    });
+    this.healthUpdates = next.catch(() => undefined);
+    return next;
   }
 
-  private nextErrorOrListDelay(): number {
-    if (this.consecutiveFailures === 0) return this.listIntervalMs;
-    return Math.min(this.config.orders.errorBackoffMaxMs, 10_000 * 2 ** Math.min(6, this.consecutiveFailures - 1));
+  private requiredTrackingHealth(): PollHealth[] {
+    return [...new Set([...this.activeOrderNrs, ...this.tracking.keys()])]
+      .map((orderNr) => this.trackingHealth.get(orderNr) ?? emptyHealth());
+  }
+
+  private isFresh(health: PollHealth): boolean {
+    const maxAge = Math.max(this.config.orders.pollMaxMs * 2, this.config.eats.timeoutMs * 2);
+    return health.lastSuccessAt !== undefined && health.failures === 0 && !health.authExpired &&
+      Date.now() - health.lastSuccessAt <= maxAge;
+  }
+
+  private nextDelay(health: PollHealth): number {
+    if (health.failures === 0) return this.listIntervalMs;
+    return Math.min(this.config.orders.errorBackoffMaxMs, 10_000 * 2 ** Math.min(6, health.failures - 1));
   }
 
   private clampInterval(value: number): number {

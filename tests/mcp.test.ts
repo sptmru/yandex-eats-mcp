@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { YandexEatsClient } from "../src/eats/client.js";
 import { createLogger } from "../src/logger.js";
 import { createYandexEatsMcpServer } from "../src/mcp/server.js";
+import { FoodPreferenceStore } from "../src/recommendations/preferences-store.js";
+import { RecommendationService } from "../src/recommendations/service.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -16,6 +18,64 @@ afterEach(async () => {
 });
 
 describe("MCP contract", () => {
+  it("preserves omitted options in quantity-only cart updates", async () => {
+    const context = await createTestConnection();
+    const update = vi.spyOn(context.eatsClient, "updateCartItem").mockResolvedValue({
+      operationId: "73b929ee-d660-4e50-8a8c-c1f0788a1b53",
+      before: { items: [], violatedConstraints: [] },
+      after: { items: [], violatedConstraints: [] },
+    });
+    try {
+      const result = await context.mcpClient.callTool({ name: "update_cart_item", arguments: {
+        placeSlug: "test-cafe", cartItemId: "cart-item-1", quantity: 2,
+        operationId: "73b929ee-d660-4e50-8a8c-c1f0788a1b53",
+      } });
+      expect(result.isError).not.toBe(true);
+      expect(update).toHaveBeenCalledWith({
+        placeSlug: "test-cafe", cartItemId: "cart-item-1", quantity: 2,
+        operationId: "73b929ee-d660-4e50-8a8c-c1f0788a1b53",
+      });
+    } finally {
+      await context.close();
+    }
+  });
+
+  it.each(["recommend_food", "search_items"])("forwards MCP cancellation to %s", async (tool) => {
+    const context = await createTestConnection();
+    const controller = new AbortController();
+    let markStarted!: () => void;
+    let markCancelled!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const cancelled = new Promise<void>((resolve) => { markCancelled = resolve; });
+    const operation = (_input: unknown, signal?: AbortSignal): Promise<never> => new Promise((_resolve, reject) => {
+      if (!signal) {
+        markStarted();
+        reject(new Error("MCP cancellation signal missing"));
+        return;
+      }
+      signal.addEventListener("abort", () => {
+        markCancelled();
+        reject(new Error("Recommendation cancelled"));
+      }, { once: true });
+      markStarted();
+    });
+    vi.spyOn(context.recommendations, "recommend").mockImplementation(operation);
+    vi.spyOn(context.recommendations, "searchItems").mockImplementation(operation);
+    try {
+      const pending = context.mcpClient.callTool({
+        name: tool,
+        arguments: tool === "recommend_food" ? { query: "salad" } : { queries: ["salad"] },
+      }, undefined, { signal: controller.signal });
+      const rejected = expect(pending).rejects.toBeDefined();
+      await started;
+      controller.abort();
+      await rejected;
+      await cancelled;
+    } finally {
+      await context.close();
+    }
+  });
+
   it("advertises focused tools with safety annotations and structured capabilities", async () => {
     const directory = await mkdtemp(join(tmpdir(), "yandex-eats-mcp-tools-"));
     temporaryDirectories.push(directory);
@@ -75,6 +135,11 @@ describe("MCP contract", () => {
         foodRecommendationsSupported: true,
         foodPreferencesSupported: true,
       });
+      const activeOrders = await mcpClient.callTool({ name: "get_active_orders", arguments: {} });
+      expect(activeOrders.isError).not.toBe(true);
+      expect(activeOrders.structuredContent).toMatchObject({
+        monitorEnabled: false, monitorHealthy: true, listHealthy: false, trackingHealthy: true,
+      });
       const events = listed.tools.find((tool) => tool.name === "get_order_events");
       expect(events?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
       const recommendations = listed.tools.find((tool) => tool.name === "recommend_food");
@@ -106,3 +171,25 @@ describe("MCP contract", () => {
     }
   });
 });
+
+async function createTestConnection() {
+  const directory = await mkdtemp(join(tmpdir(), "yandex-eats-mcp-contract-"));
+  temporaryDirectories.push(directory);
+  const config = loadConfig({
+    NODE_ENV: "test", MCP_AUTH_MODE: "none", MCP_STATE_DIR: directory,
+    YANDEX_EATS_COOKIE_FILE: join(directory, "missing-cookie"),
+  });
+  const logger = createLogger("silent");
+  const eatsClient = new YandexEatsClient(config, logger, () => Promise.reject(new Error("No upstream requests expected")));
+  await eatsClient.initialize();
+  const recommendations = new RecommendationService(eatsClient, new FoodPreferenceStore(directory, logger), logger);
+  const server = createYandexEatsMcpServer(eatsClient, config, logger, undefined, recommendations);
+  const mcpClient = new Client({ name: "contract-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await mcpClient.connect(clientTransport);
+  return { eatsClient, recommendations, mcpClient, close: async () => {
+    await mcpClient.close();
+    await server.close();
+  } };
+}

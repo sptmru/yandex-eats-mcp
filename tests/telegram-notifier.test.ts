@@ -11,10 +11,12 @@ describe("TelegramOrderNotifier", () => {
     });
     const notifier = new TelegramOrderNotifier("secret-token", "12345", fakeFetch);
     const event = sampleEvent();
+    const controller = new AbortController();
 
-    await notifier.send(event);
+    await notifier.send(event, controller.signal);
 
     expect(calls[0]?.input).toBe("https://api.telegram.org/botsecret-token/sendMessage");
+    expect(calls[0]?.init?.signal).toBe(controller.signal);
     const body = JSON.parse(requestBody(calls[0]?.init?.body)) as { chat_id: string; text: string };
     expect(body.chat_id).toBe("12345");
     expect(body.text).toContain("***6789");

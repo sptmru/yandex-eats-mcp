@@ -9,6 +9,7 @@ type PersistedState = {
   initialized: boolean;
   sequence: number;
   authExpired: boolean;
+  notificationAcknowledgedSequence: number;
   lastSuccessfulPollAt?: string;
   snapshots: Record<string, NormalizedOrderStatus>;
 };
@@ -18,6 +19,7 @@ const EMPTY_STATE: PersistedState = {
   initialized: false,
   sequence: 0,
   authExpired: false,
+  notificationAcknowledgedSequence: 0,
   snapshots: {},
 };
 
@@ -26,6 +28,7 @@ export class OrderStateStore {
   private readonly eventsPath: string;
   private state: PersistedState = structuredClone(EMPTY_STATE);
   private events: OrderEvent[] = [];
+  private notificationSequences = new Set<number>();
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -33,6 +36,7 @@ export class OrderStateStore {
     private readonly retentionDays: number,
     private readonly maxCount: number,
     private readonly logger: Logger,
+    private readonly notificationProvider: "none" | "telegram" = "none",
   ) {
     this.statePath = join(stateDir, "order-monitor-state.json");
     this.eventsPath = join(stateDir, "order-events.jsonl");
@@ -42,9 +46,13 @@ export class OrderStateStore {
     await mkdir(join(this.statePath, ".."), { recursive: true });
     this.state = await this.loadState();
     this.events = await this.loadEvents();
+    const persistedSequence = this.state.sequence;
     for (const event of this.events) {
       this.state.sequence = Math.max(this.state.sequence, event.sequence);
-      if (event.current) this.state.snapshots[event.current.orderNr] = event.current;
+      if (event.sequence > persistedSequence) {
+        if (event.current) this.state.snapshots[event.current.orderNr] = event.current;
+        this.applyMonitorTransition(event);
+      }
     }
     await this.compactAndPersist();
   }
@@ -103,13 +111,6 @@ export class OrderStateStore {
     });
   }
 
-  async setAuthExpired(value: boolean): Promise<void> {
-    await this.enqueue(async () => {
-      this.state.authExpired = value;
-      await this.persistState();
-    });
-  }
-
   async commitEvent(input: {
     type: OrderEventType;
     summary: string;
@@ -130,15 +131,38 @@ export class OrderStateStore {
         ...(input.current ? { current: input.current } : {}),
         summary: input.summary,
       };
-      await appendFile(this.eventsPath, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
+      // The event journal is also the outbox: the intent to notify is committed
+      // in the same append, before snapshots or any delivery can advance.
+      await appendFile(this.eventsPath, `${JSON.stringify({
+        ...event,
+        ...(this.notificationProvider === "telegram" ? { notificationProvider: "telegram" } : {}),
+      })}\n`, { encoding: "utf8", mode: 0o600 });
+      if (this.notificationProvider === "telegram") this.notificationSequences.add(event.sequence);
       this.events.push(event);
       this.state.sequence = event.sequence;
+      this.applyMonitorTransition(event);
       if (input.current) this.state.snapshots[input.current.orderNr] = input.current;
       await this.persistState();
       await this.compactIfNeeded();
       committed = event;
     });
     return committed;
+  }
+
+  getPendingNotifications(limit: number): OrderEvent[] {
+    return this.events.filter((event) => this.notificationSequences.has(event.sequence) &&
+      event.sequence > this.state.notificationAcknowledgedSequence).slice(0, limit);
+  }
+
+  async acknowledgeNotification(event: OrderEvent): Promise<void> {
+    await this.enqueue(async () => {
+      const oldest = this.getPendingNotifications(1)[0];
+      if (!oldest || oldest.id !== event.id) throw new Error("Notifications must be acknowledged in sequence");
+      const nextState = { ...this.state, notificationAcknowledgedSequence: event.sequence };
+      await atomicWrite(this.statePath, `${JSON.stringify(nextState, null, 2)}\n`);
+      this.state = nextState;
+      await this.compactIfNeeded();
+    });
   }
 
   getEvents(input: { afterSequence?: number; limit: number; orderNr?: string }): { events: OrderEvent[]; nextSequence: number; hasMore: boolean } {
@@ -180,6 +204,8 @@ export class OrderStateStore {
         initialized: record.initialized,
         sequence: Math.max(0, Math.floor(record.sequence)),
         authExpired: record.authExpired === true,
+        notificationAcknowledgedSequence: typeof record.notificationAcknowledgedSequence === "number"
+          ? Math.max(0, Math.floor(record.notificationAcknowledgedSequence)) : 0,
         ...(typeof record.lastSuccessfulPollAt === "string" ? { lastSuccessfulPollAt: record.lastSuccessfulPollAt } : {}),
         snapshots,
       };
@@ -197,7 +223,11 @@ export class OrderStateStore {
       const content = await readFile(this.eventsPath, "utf8");
       return content.split("\n").filter(Boolean).flatMap((line) => {
         try {
-          const result = orderEventSchema.safeParse(JSON.parse(line) as unknown);
+          const raw = JSON.parse(line) as unknown;
+          const result = orderEventSchema.safeParse(raw);
+          if (result.success && asRecord(raw)?.notificationProvider === "telegram") {
+            this.notificationSequences.add(result.data.sequence);
+          }
           return result.success ? [result.data] : [];
         } catch {
           return [];
@@ -223,15 +253,29 @@ export class OrderStateStore {
 
   private pruneEvents(): void {
     const cutoff = Date.now() - this.retentionDays * 86_400_000;
-    this.events = this.events.filter((event) => Date.parse(event.occurredAt) >= cutoff).slice(-this.maxCount);
+    const retained = new Set(this.events.filter((event) => Date.parse(event.occurredAt) >= cutoff)
+      .slice(-this.maxCount).map((event) => event.sequence));
+    // Pending deliveries are never evicted by the history retention policy.
+    this.events = this.events.filter((event) => retained.has(event.sequence) ||
+      (this.notificationSequences.has(event.sequence) && event.sequence > this.state.notificationAcknowledgedSequence));
+    const remaining = new Set(this.events.map((event) => event.sequence));
+    this.notificationSequences = new Set([...this.notificationSequences].filter((sequence) => remaining.has(sequence)));
   }
 
   private async persistState(): Promise<void> {
     await atomicWrite(this.statePath, `${JSON.stringify(this.state, null, 2)}\n`);
   }
 
+  private applyMonitorTransition(event: OrderEvent): void {
+    if (event.type === "monitor.auth_expired") this.state.authExpired = true;
+    if (event.type === "monitor.recovered") this.state.authExpired = false;
+  }
+
   private async rewriteEvents(): Promise<void> {
-    const content = this.events.map((event) => JSON.stringify(event)).join("\n");
+    const content = this.events.map((event) => JSON.stringify({
+      ...event,
+      ...(this.notificationSequences.has(event.sequence) ? { notificationProvider: "telegram" } : {}),
+    })).join("\n");
     await atomicWrite(this.eventsPath, content ? `${content}\n` : "");
   }
 }

@@ -54,8 +54,11 @@ export type OrderEvent = z.infer<typeof orderEventSchema>;
 export type OrderMonitorHealth = {
   monitorEnabled: boolean;
   monitorHealthy: boolean;
+  listHealthy: boolean;
+  trackingHealthy: boolean;
   authExpired: boolean;
   lastSuccessfulPollAt?: string;
+  lastSuccessfulListPollAt?: string;
   orders: NormalizedOrderStatus[];
 };
 

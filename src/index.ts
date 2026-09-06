@@ -19,8 +19,36 @@ async function main(): Promise<void> {
   const app = await createHttpApp(config, client, logger, orderMonitor);
   const server = createServer(app);
 
+  process.on("SIGHUP", () => {
+    void client.session.reloadCookie().then((loaded) => {
+      logger.info({ cookieLoaded: loaded }, "Reloaded Yandex Eats cookie secret");
+      orderMonitor.wake();
+    }).catch((error: unknown) => {
+      logger.error({ err: error }, "Failed to reload Yandex Eats cookie secret");
+    });
+  });
+
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ signal }, "Shutting down Yandex Eats MCP server");
+    const deadline = setTimeout(() => {
+      logger.error("Forced shutdown after grace period");
+      process.exit(1);
+    }, 10_000).unref();
+    void Promise.all([orderMonitor.stop(), closeServer(server)]).catch((error: unknown) => {
+      logger.error({ err: error }, "Graceful shutdown failed");
+      process.exitCode = 1;
+    }).finally(() => clearTimeout(deadline));
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+
   await listen(server, config.port, config.host);
+  if (shuttingDown) return;
   await orderMonitor.start();
+  if (shuttingDown) return;
   logger.info(
     {
       host: config.host,
@@ -32,30 +60,6 @@ async function main(): Promise<void> {
     },
     "Yandex Eats MCP server started",
   );
-
-  process.on("SIGHUP", () => {
-    void client.session.reloadCookie().then((loaded) => {
-      logger.info({ cookieLoaded: loaded }, "Reloaded Yandex Eats cookie secret");
-      orderMonitor.wake();
-    });
-  });
-
-  let shuttingDown = false;
-  const shutdown = (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logger.info({ signal }, "Shutting down Yandex Eats MCP server");
-    void Promise.all([orderMonitor.stop(), closeServer(server)]).catch((error: unknown) => {
-      logger.error({ err: error }, "Graceful shutdown failed");
-      process.exitCode = 1;
-    });
-    setTimeout(() => {
-      logger.error("Forced shutdown after grace period");
-      process.exit(1);
-    }, 10_000).unref();
-  };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 function closeServer(server: Server): Promise<void> {

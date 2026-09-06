@@ -70,12 +70,16 @@ export async function createHttpApp(
   });
   app.get("/readyz", (_req, res) => {
     const health = orderMonitor.getHealth();
-    res.status(200).json({
-      status: "ready",
+    const ready = !health.monitorEnabled || health.monitorHealthy;
+    res.status(ready ? 200 : 503).json({
+      status: ready ? "ready" : "degraded",
       monitorEnabled: health.monitorEnabled,
       monitorHealthy: health.monitorHealthy,
+      listHealthy: health.listHealthy,
+      trackingHealthy: health.trackingHealthy,
       authExpired: health.authExpired,
       ...(health.lastSuccessfulPollAt ? { lastSuccessfulPollAt: health.lastSuccessfulPollAt } : {}),
+      ...(health.lastSuccessfulListPollAt ? { lastSuccessfulListPollAt: health.lastSuccessfulListPollAt } : {}),
     });
   });
   app.get("/", (_req, res) => {
@@ -91,13 +95,13 @@ export async function createHttpApp(
   app.post("/mcp", authMiddleware, async (req, res) => {
     const server = createYandexEatsMcpServer(client, config, logger, orderMonitor, recommendationService);
     const transport = new StreamableHTTPServerTransport();
+    res.once("close", () => {
+      void transport.close().catch(() => undefined);
+      void server.close().catch(() => undefined);
+    });
     try {
       await server.connect(transport as unknown as Transport);
       await transport.handleRequest(req, res, req.body);
-      res.on("close", () => {
-        void transport.close();
-        void server.close();
-      });
     } catch (error) {
       logger.error({ err: error }, "Failed to handle MCP request");
       if (!res.headersSent) {
@@ -158,7 +162,7 @@ async function configureAuth(app: Express, config: AppConfig, logger: Logger): P
   app.post(
     "/oauth/approve",
     express.urlencoded({ extended: false, limit: "8kb" }),
-    (req, res) => void provider.approve(req, res),
+    (req, res, next) => void provider.approve(req, res).catch(next),
   );
   app.use(
     mcpAuthRouter({

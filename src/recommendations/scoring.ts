@@ -53,7 +53,10 @@ export function scoreCandidate(
   const text = [candidate.name, candidate.searchName, candidate.description, ...candidate.menuCategories].filter(Boolean).join(" ");
   if (input.maxPrice !== undefined && candidate.price > input.maxPrice) return undefined;
   if (input.maxHeaviness !== undefined && candidate.normalized.heaviness > input.maxHeaviness) return undefined;
-  if (candidate.intentMatches.some((match) => match.matchedExcludedTerms.length > 0)) return undefined;
+  // Person groups are alternatives for an individual dish. A conflict with
+  // another person's request must not discard an otherwise eligible dish.
+  if (candidate.intentMatches.length > 0 &&
+    candidate.intentMatches.every((match) => match.matchedExcludedTerms.length > 0)) return undefined;
   if ((input.avoid ?? []).some((term) => termMatchesDish(term, candidate.normalized, text))) return undefined;
   const hasSemanticIntent = candidate.intentMatches.some((match) =>
     match.requiredTerms.some((term) => canonicalValues(term).length > 0)

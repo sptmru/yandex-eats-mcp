@@ -269,7 +269,157 @@ describe("YandexEatsClient HTTP contract", () => {
     expect(mutationCalls).toBe(1);
     expect(fullCartLoads).toBe(2);
   });
+
+  it.each(["add", "update", "remove"] as const)("requires reconciliation after %s succeeds but the final cart read fails", async (mutation) => {
+    const fixture = await cartFixture({ failAfterMutation: true });
+    const input = { placeSlug: "place-one", operationId: "saved-operation" };
+    const perform = () => mutation === "add"
+      ? fixture.client.addItems({ ...input, placeBusiness: "restaurant", items: [{ itemId: "42", quantity: 1, options: [] }] })
+      : mutation === "update"
+        ? fixture.client.updateCartItem({ ...input, cartItemId: "cart-1", quantity: 2 })
+        : fixture.client.removeCartItem({ ...input, cartItemId: "cart-1" });
+
+    await expect(perform()).rejects.toMatchObject({
+      code: "MUTATION_STATUS_UNKNOWN",
+      retryable: false,
+      details: { ...input, mutationAccepted: true, reconciliationRequired: true },
+    });
+    await expect(perform()).rejects.toMatchObject({ code: "MUTATION_STATUS_UNKNOWN", retryable: false });
+    expect(fixture.mutations).toHaveLength(1);
+  });
+
+  it.each([
+    { menu: { inStock: 0 }, quantity: 1, code: "PLACE_UNAVAILABLE" },
+    { menu: { inStock: 1 }, quantity: 2, code: "VALIDATION_ERROR" },
+    { menu: {}, quantity: 0, code: "VALIDATION_ERROR" },
+    { menu: {}, quantity: 1.5, code: "VALIDATION_ERROR" },
+    { menu: { optionsGroups: [{ id: "size", name: "Size", minSelected: 1, maxSelected: 1, options: [] }] }, quantity: 1, code: "REQUIRES_CONFIGURATION" },
+  ])("rejects invalid stock, quantity or missing configuration before writing ($code)", async ({ menu, quantity, code }) => {
+    const fixture = await cartFixture({ menuItem: menu });
+    await expect(fixture.client.addItems({
+      placeSlug: "place-one", placeBusiness: "restaurant", operationId: "invalid-add",
+      items: [{ itemId: "42", quantity, options: [] }],
+    })).rejects.toMatchObject({ code });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  it("counts duplicate item entries against the same stock limit", async () => {
+    const fixture = await cartFixture({ menuItem: { inStock: 1 } });
+    await expect(fixture.client.addItems({
+      placeSlug: "place-one", placeBusiness: "restaurant", operationId: "duplicate-stock",
+      items: [{ itemId: "42", quantity: 1, options: [] }, { itemId: "42", quantity: 1, options: [] }],
+    })).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  it("rejects available items inside an unavailable parent category", async () => {
+    const fixture = await cartFixture({ parentCategoryAvailable: false });
+    await expect(fixture.client.addItems({
+      placeSlug: "place-one", placeBusiness: "restaurant", operationId: "disabled-category",
+      items: [{ itemId: "42", quantity: 1, options: [] }],
+    })).rejects.toMatchObject({ code: "PLACE_UNAVAILABLE" });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  it.each([
+    [{ groupId: "size", groupName: "Size", selected: [] }],
+    [{ groupId: "size", groupName: "Size", selected: [{ optionId: "large", quantity: 0 }] }],
+    [{ groupId: "size", groupName: "Size", selected: [{ optionId: "large", quantity: 1 }, { optionId: "large", quantity: 1 }] }],
+    [{ groupId: "size", groupName: "Size", selected: [{ optionId: "large", quantity: 1 }] }, { groupId: "size", groupName: "Size", selected: [{ optionId: "large", quantity: 1 }] }],
+    [{ groupId: "size", groupName: "Size", selected: [{ optionId: "unknown", quantity: 1 }] }],
+  ])("rejects missing, duplicate or invalid option selections (%j)", async (...options) => {
+    const fixture = await cartFixture({ menuItem: configuredMenuItem });
+    await expect(fixture.client.addItems({
+      placeSlug: "place-one", placeBusiness: "restaurant", operationId: "invalid-options",
+      items: [{ itemId: "42", quantity: 1, options }],
+    })).rejects.toMatchObject({ retryable: false });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  it("preserves configured options in quantity-only updates and validates explicit replacements", async () => {
+    const fixture = await cartFixture({ menuItem: configuredMenuItem });
+    await fixture.client.updateCartItem({ placeSlug: "place-one", cartItemId: "cart-1", quantity: 2, operationId: "quantity-only" });
+    expect(JSON.parse(requestBody(fixture.mutations[0]?.body))).toEqual({ quantity: 2 });
+    await expect(fixture.client.updateCartItem({
+      placeSlug: "place-one", cartItemId: "cart-1", quantity: 2, options: [], operationId: "clear-required",
+    })).rejects.toMatchObject({ code: "REQUIRES_CONFIGURATION" });
+    expect(fixture.mutations).toHaveLength(1);
+  });
+
+  it.each(["update", "remove"] as const)("rejects %s for an item absent from the requested cart", async (mutation) => {
+    const fixture = await cartFixture();
+    const input = { placeSlug: "place-one", cartItemId: "another-cart-item", operationId: "wrong-cart" };
+    await expect(mutation === "update"
+      ? fixture.client.updateCartItem({ ...input, quantity: 2 })
+      : fixture.client.removeCartItem(input)).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  it.each(["search", "menu", "orders", "refresh", "tracking"] as const)("does not retry caller-cancelled %s reads", async (kind) => {
+    const directory = await temporaryDirectory();
+    const cookieFile = join(directory, "cookie");
+    await writeFile(cookieFile, "Session_id=session-value");
+    const controller = new AbortController();
+    const reason = new Error("Caller deadline reached");
+    const fakeFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.signal?.aborted).toBe(false);
+      controller.abort(reason);
+      expect(init?.signal?.aborted).toBe(true);
+      return Promise.reject(reason);
+    });
+    const client = new YandexEatsClient(testConfig(directory, cookieFile, false), createLogger("silent"), fakeFetch);
+    await client.initialize();
+    const perform = () => {
+      switch (kind) {
+        case "search": return client.search({ query: "lunch" }, { signal: controller.signal });
+        case "menu": return client.getMenu({ placeSlug: "place-one" }, { signal: controller.signal });
+        case "orders": return client.listOrders(undefined, controller.signal);
+        case "refresh": return client.refreshOrders(["123"], controller.signal);
+        case "tracking": return client.getDesktopTracking("123", controller.signal);
+      }
+    };
+    await expect(perform()).rejects.toBe(reason);
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+    await expect(perform()).rejects.toBe(reason);
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
 });
+
+const configuredMenuItem = {
+  optionsGroups: [{
+    id: "size", name: "Size", required: true, minSelected: 0, maxSelected: 3,
+    options: [{ id: "large", name: "Large" }],
+  }],
+};
+
+async function cartFixture(options: { failAfterMutation?: boolean; menuItem?: Record<string, unknown>; parentCategoryAvailable?: boolean } = {}) {
+  const directory = await temporaryDirectory();
+  const cookieFile = join(directory, "cookie");
+  await writeFile(cookieFile, "Session_id=session-value");
+  const mutations: RequestInit[] = [];
+  const fakeFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    const path = requestUrl(input).pathname;
+    if (path.includes("menu/retrieve")) return Promise.resolve(jsonResponse({ payload: { categories: [{
+      id: "parent", name: "Parent", available: options.parentCategoryAvailable ?? true, items: [], categories: [{
+        id: 1, name: "Food", items: [{ id: 42, name: "Lunch", decimalPrice: "1200", available: true, optionsGroups: [], ...options.menuItem }],
+      }],
+    }] } }));
+    if (path.includes("full-carts")) {
+      if (options.failAfterMutation && mutations.length > 0) return Promise.reject(new DOMException("timed out", "TimeoutError"));
+      return Promise.resolve(jsonResponse({ cart: {
+        place_slug: "place-one", items: [{ id: "cart-1", item_id: 42, name: "Lunch", quantity: 1 }], decimal_total: "1200",
+      } }));
+    }
+    if (path.startsWith("/api/v1/cart")) {
+      mutations.push(init ?? {});
+      return Promise.resolve(jsonResponse({ cart: {} }));
+    }
+    return Promise.reject(new Error(`Unexpected request ${path}`));
+  });
+  const client = new YandexEatsClient(testConfig(directory, cookieFile, true), createLogger("silent"), fakeFetch);
+  await client.initialize();
+  return { client, mutations };
+}
 
 function testConfig(directory: string, cookieFile: string, mutationsEnabled: boolean) {
   return loadConfig({

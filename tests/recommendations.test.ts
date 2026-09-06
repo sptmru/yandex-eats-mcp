@@ -631,7 +631,7 @@ describe("preference persistence", () => {
 });
 
 describe("recommendation orchestration", () => {
-  it("reports the balanced shortlist separately from the menus it loads", async () => {
+  it("reports only the balanced shortlist selected for menu loading", async () => {
     const directory = await mkdtemp(join(tmpdir(), "recommendation-shortlist-"));
     temporaryDirectories.push(directory);
     const places = Array.from({ length: 5 }, (_, index) => ({
@@ -684,8 +684,8 @@ describe("recommendation orchestration", () => {
 
     expect(result).toMatchObject({
       candidatePlaces: 5,
-      shortlistedPlaces: 4,
-      shortlistReasons: { "суп": 4 },
+      shortlistedPlaces: 2,
+      shortlistReasons: { "суп": 2 },
       menusLoaded: 2,
     });
     expect(getMenu).toHaveBeenCalledTimes(2);

@@ -164,10 +164,10 @@ export function createYandexEatsMcpServer(
       outputSchema: foodSearchResultSchema.shape,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     },
-    async (input) => toolCall(
+    async (input, extra) => toolCall(
       logger,
       "search_items",
-      () => recommendationService.searchItems(compactOptional(input)),
+      () => recommendationService.searchItems(compactOptional(input), extra.signal),
       (value) => `Found ${value.results.length} verified menu items from ${value.menusLoaded} menus.`,
     ),
   );
@@ -208,10 +208,10 @@ export function createYandexEatsMcpServer(
       outputSchema: recommendationResultSchema.shape,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     },
-    async (input) => toolCall(
+    async (input, extra) => toolCall(
       logger,
       "recommend_food",
-      () => recommendationService.recommend(compactOptional(input)),
+      () => recommendationService.recommend(compactOptional(input), extra.signal),
       (value) => `Recommended ${value.results.length} diverse dishes from ${value.menusLoaded} current menus.`,
     ),
   );
@@ -331,8 +331,11 @@ export function createYandexEatsMcpServer(
       outputSchema: {
         monitorEnabled: z.boolean(),
         monitorHealthy: z.boolean(),
+        listHealthy: z.boolean(),
+        trackingHealthy: z.boolean(),
         authExpired: z.boolean(),
         lastSuccessfulPollAt: z.string().optional(),
+        lastSuccessfulListPollAt: z.string().optional(),
         orders: z.array(normalizedOrderStatusSchema),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
@@ -435,12 +438,12 @@ export function createYandexEatsMcpServer(
     {
       title: "Update a cart item",
       description:
-        "Set the quantity and exact options for one existing cart item after an explicit user request. Returns before and fresh after snapshots.",
+        "Set the quantity of one existing cart item after an explicit user request. Omit options to preserve its current configuration; provide options only to replace the complete selection. Returns before and fresh after snapshots.",
       inputSchema: {
         placeSlug: z.string().trim().min(1).max(300),
         cartItemId: z.union([z.string(), z.number()]).transform(String),
         quantity: z.number().int().min(1).max(20),
-        options: z.array(optionInputSchema).default([]),
+        options: z.array(optionInputSchema).optional(),
         operationId: z.string().uuid().optional(),
       },
       outputSchema: {
@@ -454,7 +457,7 @@ export function createYandexEatsMcpServer(
       toolCall(
         logger,
         "update_cart_item",
-        () => client.updateCartItem({ ...input, operationId: input.operationId ?? randomUUID() }),
+        () => client.updateCartItem({ ...compactOptional(input), operationId: input.operationId ?? randomUUID() }),
         (value) => describeMutation("Updated item", value.before.items.length, value.after.items.length, value.after.total),
       ),
   );

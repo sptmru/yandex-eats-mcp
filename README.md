@@ -186,9 +186,11 @@ The OAuth owner page explicitly states that it grants search, recommendation, pr
 | `remove_cart_item` | Yes, destructive | Never an automatic optimization |
 | `server_capabilities` | No | Reports enabled safety boundaries |
 
-Every mutation accepts an optional UUID `operationId`; repeating the same operation within ten minutes returns the same in-process result instead of repeating the upstream mutation. Reusing the ID with different arguments is rejected. Unsafe upstream requests are never automatically retried. If the response is lost or times out, the tool returns `MUTATION_STATUS_UNKNOWN`; call `get_cart` to reconcile.
+Every mutation accepts an optional UUID `operationId`; repeating the same operation within ten minutes returns the same in-process result instead of repeating the upstream mutation. Reusing the ID with different arguments is rejected. Unsafe upstream requests are never automatically retried. If the response is lost or times out, the tool returns non-retryable `MUTATION_STATUS_UNKNOWN` with the operation ID and restaurant reference; call `get_cart` to reconcile. The same error is returned when the mutation was accepted but the subsequent cart read failed, with `details.mutationAccepted=true`. Do not repeat an accepted mutation with a new operation ID.
 
 After any successful mutation, the MCP reloads and returns the server cart. Budget checks must use that fresh total and its violated constraints, not a local sum.
+
+Cart writes validate current availability, stated stock, and mandatory option groups, including groups with `minSelected > 0` even when the upstream omits `required`. Updates and removals verify that the item belongs to the requested cart. For a quantity-only `update_cart_item`, omit `options` to preserve the existing selection; supplying `options` replaces the complete selection and validates it against the menu.
 
 ## Food recommendations
 
@@ -219,7 +221,7 @@ Each result includes restaurant metadata, item ID/name/description/price/weight,
 
 Use `cuisines`, `proteins`, and `cookingMethods` for dimension-specific constraints. Values within one top-level dimension are alternatives, while populated top-level dimensions are combined with AND. Use `anyOf` when alternatives cross dimensions: branches are ORed, and populated dimensions inside one branch are ANDed. Top-level constraints remain additional global AND filters. `categories` remains a backward-compatible semantic umbrella, so a normalized cuisine such as `asian` supplied there is routed to the matching normalized dimension instead of producing an empty result solely because it is not a dish category.
 
-Natural-language lists such as `рыба, морепродукты, салат или суп`, slash-separated lists, and `либо` are parsed as alternatives; shared modifiers such as `light` are applied to every branch. English and Russian person markers form separate intent groups. With `sameRestaurant=true`, restaurant selection maximizes the sum of the best coverage for every group before comparing item scores. Unknown but meaningful phrases such as `salsa verde` remain lexical preferences, so a required-concept-only match receives partial rather than full coverage.
+Natural-language lists such as `рыба, морепродукты, салат или суп`, slash-separated lists, and `либо` are parsed as alternatives; shared modifiers such as `light` are applied to every branch. English and Russian person markers form separate intent groups. Individual exclusions stay with the person: `Из одного ресторана: мне салат без рыбы, ей рыба` excludes fish from the first person's selection only. Top-level `avoid` constraints apply to everyone. With `sameRestaurant=true`, all returned dishes come from one restaurant, including requests with a single intent group. Restaurant selection maximizes group coverage before comparing item scores. Unknown but meaningful phrases such as `salsa verde` remain lexical preferences, so a required-concept-only match receives partial rather than full coverage.
 
 `cookingMethods` describes preparation detected in the item name, translated search name, or menu category. Methods found only in the description are exposed separately as `ingredientCookingMethods`; a fried garnish therefore does not mark the whole dish as `fried`. Search item IDs are joined back to full-menu item IDs, so a translated search hit can verify a menu item even when the restaurant publishes its full menu in another language. Search-item ranking includes exact menu/translated-name matching, required-concept confidence, heaviness and stated-weight fit, rating, ETA, and a small restaurant/category diversity penalty. `heaviness` is an inspectable recommendation heuristic based on dish wording, preparation, compound-dish rules, sauce, category, and stated weight. It is not nutritional or medical data. Missing Armenian-market currency metadata is normalized to `AMD`, including the `֏` sign.
 
@@ -237,6 +239,8 @@ For an explicit multi-query search without preference-aware ranking, use:
 
 The ordinary `search` tool remains backward-compatible and exposes Yandex's fast search projection. Use `search_items` or `recommend_food` when a menu-level match is required. Recommendation calls are slower and consume more upstream requests because they verify full menus. Ratings, delivery fees, rating counts, and similar fields are returned only when the relevant Yandex response actually exposes them.
 
+Recommendation retrieval has a 45-second time budget, with up to three concurrent searches and three concurrent menu loads per call. The search stage reserves time for menu verification. Individual transient upstream failures or an exhausted budget produce partial results with `warnings`; authentication and configuration errors remain errors. MCP cancellation propagates to upstream requests. The shared menu cache retains at most 100 menus for five minutes, evicts expired entries, and shares in-flight loads for the same restaurant; cancelling one caller does not cancel a load still needed by another caller.
+
 ## Order monitoring and Telegram
 
 Monitoring is independent of cart mutations and uses only read-like requests. Enable it with:
@@ -246,9 +250,11 @@ YANDEX_EATS_ENABLE_ORDER_MONITORING=true
 ORDER_NOTIFY_PROVIDER=telegram
 ```
 
-The list and tracking intervals are supplied by Yandex and clamped by `YANDEX_EATS_ORDER_POLL_MIN_MS` / `YANDEX_EATS_ORDER_POLL_MAX_MS`. Network, 429, and 5xx failures use bounded backoff. A 401/403 creates one `monitor.auth_expired` event; after the cookie is replaced, `SIGHUP` wakes the monitor immediately and recovery produces `monitor.recovered`.
+The list and tracking intervals are supplied by Yandex and clamped by `YANDEX_EATS_ORDER_POLL_MIN_MS` / `YANDEX_EATS_ORDER_POLL_MAX_MS`. Network, 429, and 5xx failures use bounded backoff. List and tracking health are evaluated separately; a successful order-list request cannot clear a tracking failure. A 401/403 creates one `monitor.auth_expired` event; after the cookie is replaced, `SIGHUP` wakes the monitor immediately. Recovery is reported only after the required components have recovered.
 
 The first successful snapshot is a baseline, so deploying the monitor does not notify about historical orders. Later discoveries and fingerprint changes create monotonically sequenced events. Telegram messages mask the order number and omit address, coordinates, phone, payment, map payload, and courier identity.
+
+Telegram delivery intent is persisted with each new event, and successful delivery is acknowledged durably. Pending notifications resume after restart and are retained until acknowledged, even beyond ordinary event-history retention limits. Events recorded before this delivery mechanism was introduced are not replayed. Each send has a ten-second deadline; shutdown cancels sends and retry waits. Delivery is at least once: if Telegram accepts a message immediately before a process crash or lost response, replay can produce a duplicate because Telegram does not provide an idempotency key for this call.
 
 To poll from ChatGPT, retain `nextSequence` from `get_order_events` and pass it back as `afterSequence`. The cursor is exclusive and reading does not acknowledge events for other clients.
 
@@ -288,14 +294,16 @@ No automatic Passport login, OTP, CAPTCHA handling, or token harvesting is imple
 
 ## Development and tests
 
+Use Node 22, matching the production Docker image (`nvm use` reads `.nvmrc`). CI runs the full quality gate on Node 22, audits production dependencies, and builds the production image.
+
 ```bash
-npm install
+npm ci
 npm run check
 docker compose config
 docker compose build
 ```
 
-The normal test suite uses sanitized fixtures and mocked upstream responses. It verifies mapper tolerance, exact request wiring, recommendation normalization/scoring/deduplication/diversification, preference persistence, no retry for ambiguous mutations, mutation serialization/idempotency, auth persistence, and MCP tool annotations.
+The normal test suite uses sanitized fixtures and mocked upstream responses. It verifies mapper tolerance, exact request wiring, recommendation normalization/scoring/deduplication/diversification, preference persistence, no retry for ambiguous mutations, mutation serialization/idempotency, auth persistence, and MCP tool annotations. Failure regressions cover accepted mutations with failed cart reconciliation, OAuth storage recovery, person-specific exclusions, recommendation deadlines/cancellation/cache sharing, monitor health, and notification delivery across restarts.
 
 Read-only live contract tests are opt-in and require your local cookie and coordinates:
 
@@ -312,7 +320,8 @@ No live test in this repository creates an order. Normal tests never contact Yan
 ## Operational notes
 
 - State under `/app/state` includes sensitive cookie-jar and OAuth data; back it up and protect the Docker host accordingly.
-- `/readyz` reports monitor health without making an upstream request or exposing order IDs.
+- `/healthz` is process liveness. `/readyz` returns HTTP 503 when enabled monitoring has not completed its startup baseline, has failed, or has stale required data; otherwise it returns HTTP 200. It reports separate list/tracking health without making an upstream request or exposing order IDs. Disabled monitoring does not make the service unready.
+- OAuth state changes become visible only after successful persistence. A failed filesystem write does not poison later writes or consume an authorization code/refresh token; an unreadable or corrupt existing `oauth.json` is preserved and causes startup to fail instead of silently resetting authorization state.
 - Logs include endpoint, status, duration, and Yandex correlation IDs. Request/response bodies, cookies, authorization headers, session IDs, phone, address, and payment fields are redacted or not logged.
 - `AUTH_NOT_CONFIGURED`: cookie secret is missing or unreadable.
 - `AUTH_EXPIRED`: copy a fresh browser Cookie header.

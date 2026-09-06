@@ -1,58 +1,99 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { OrderEvent } from "../types.js";
 import type { OrderNotifier } from "./notifier.js";
 
-type QueueEntry = { event: OrderEvent; attempt: number };
+export interface NotificationOutbox {
+  getPendingNotifications(limit: number): OrderEvent[];
+  acknowledgeNotification(event: OrderEvent): Promise<void>;
+}
+
+type QueueOptions = { sendTimeoutMs?: number; retryBaseMs?: number; retryMaxMs?: number };
 
 export class OrderNotifierQueue {
-  private queue: QueueEntry[] = [];
-  private processing = false;
-  private stopped = false;
-  private readonly delivered = new Set<string>();
+  private outbox: NotificationOutbox | undefined;
+  private task: Promise<void> | undefined;
+  private shutdown = new AbortController();
+  private started = false;
+  private readonly sendTimeoutMs: number;
+  private readonly retryBaseMs: number;
+  private readonly retryMaxMs: number;
 
-  constructor(private readonly notifier: OrderNotifier, private readonly logger: Logger, private readonly maxSize = 100) {}
+  constructor(private readonly notifier: OrderNotifier, private readonly logger: Logger, options: QueueOptions = {}) {
+    this.sendTimeoutMs = options.sendTimeoutMs ?? 10_000;
+    this.retryBaseMs = options.retryBaseMs ?? 2_000;
+    this.retryMaxMs = options.retryMaxMs ?? 30_000;
+  }
 
-  enqueue(event: OrderEvent): void {
-    if (this.stopped || this.notifier.provider === "none" || this.delivered.has(event.id)) return;
-    if (this.queue.length >= this.maxSize) {
-      const etaIndex = this.queue.findIndex((entry) => entry.event.type === "order.eta_changed");
-      if (etaIndex >= 0) this.queue.splice(etaIndex, 1);
-      else if (event.type === "order.eta_changed") return;
-      else this.queue.shift();
-    }
-    this.queue.push({ event, attempt: 0 });
-    void this.process();
+  attachOutbox(outbox: NotificationOutbox): void {
+    this.outbox = outbox;
+  }
+
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.shutdown = new AbortController();
+    this.wake();
+  }
+
+  wake(): void {
+    if (!this.started || this.task || this.notifier.provider === "none" || !this.outbox) return;
+    this.task = this.process().catch(() => {
+      this.logger.error({ provider: this.notifier.provider }, "Order notification worker failed");
+    }).finally(() => {
+      this.task = undefined;
+      if (this.started && this.outbox?.getPendingNotifications(1).length) this.wake();
+    });
   }
 
   async stop(): Promise<void> {
-    this.stopped = true;
-    const deadline = Date.now() + 5_000;
-    while (this.processing && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    this.started = false;
+    this.shutdown.abort();
+    await this.task;
   }
 
   private async process(): Promise<void> {
-    if (this.processing) return;
-    this.processing = true;
-    try {
-      while (!this.stopped && this.queue.length > 0) {
-        const entry = this.queue.shift();
-        if (!entry) continue;
+    let attempt = 0;
+    while (this.started && this.outbox) {
+      const event = this.outbox.getPendingNotifications(1)[0];
+      if (!event) return;
+      try {
+        await this.sendWithDeadline(event);
+        // Telegram has no idempotency key: a crash after send but before this
+        // durable acknowledgement can replay a message, never silently lose it.
+        await this.outbox.acknowledgeNotification(event);
+        attempt = 0;
+      } catch (_error) {
+        if (this.shutdown.signal.aborted) return;
+        attempt += 1;
+        this.logger.warn({ provider: this.notifier.provider, eventId: event.id, attempt }, "Order notification delivery failed");
         try {
-          await this.notifier.send(entry.event);
-          this.delivered.add(entry.event.id);
-        } catch (_error) {
-          entry.attempt += 1;
-          this.logger.warn({ provider: this.notifier.provider, eventId: entry.event.id, attempt: entry.attempt }, "Order notification delivery failed");
-          if (entry.attempt < 4 && !this.stopped) {
-            await new Promise((resolve) => setTimeout(resolve, Math.min(30_000, 2 ** entry.attempt * 1_000)));
-            this.queue.unshift(entry);
-          }
+          await delay(Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** Math.min(attempt - 1, 8)), undefined, {
+            signal: this.shutdown.signal,
+          });
+        } catch {
+          return;
         }
       }
+    }
+  }
+
+  private async sendWithDeadline(event: OrderEvent): Promise<void> {
+    const deadline = new AbortController();
+    const timeout = setTimeout(() => deadline.abort(new Error("Order notification delivery timed out")), this.sendTimeoutMs);
+    const signal = AbortSignal.any([this.shutdown.signal, deadline.signal]);
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new Error("Order notification delivery aborted"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      // The race also bounds a notifier implementation that ignores AbortSignal.
+      await Promise.race([this.notifier.send(event, signal), aborted]);
     } finally {
-      this.processing = false;
+      clearTimeout(timeout);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 }

@@ -7,11 +7,12 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { YandexEatsClient } from "../src/eats/client.js";
 import { createHttpApp } from "../src/http/app.js";
 import { createLogger } from "../src/logger.js";
+import { createInactiveOrderMonitorService } from "../src/orders/order-monitor.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -20,6 +21,92 @@ afterEach(async () => {
 });
 
 describe("Streamable HTTP server", () => {
+  it("cancels an upstream recommendation search when its HTTP connection is aborted", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "yandex-eats-http-cancellation-"));
+    temporaryDirectories.push(directory);
+    const config = loadConfig({
+      NODE_ENV: "test", MCP_AUTH_MODE: "none", HOST: "127.0.0.1", MCP_STATE_DIR: directory,
+      YANDEX_EATS_COOKIE_FILE: join(directory, "missing-cookie"),
+      YANDEX_EATS_LATITUDE: "40.18", YANDEX_EATS_LONGITUDE: "44.51",
+    });
+    const logger = createLogger("silent");
+    let upstreamSignal: AbortSignal | null | undefined;
+    let releaseUpstream: (() => void) | undefined;
+    const client = new YandexEatsClient(config, logger, (_url, init) => new Promise<Response>((resolve, reject) => {
+      upstreamSignal = init?.signal;
+      releaseUpstream = () => resolve(new Response(JSON.stringify({ blocks: [] }), {
+        headers: { "content-type": "application/json" },
+      }));
+      upstreamSignal?.addEventListener("abort", () => reject(new Error("Upstream cancelled")), { once: true });
+    }));
+    await client.initialize();
+    const server = createServer(await createHttpApp(config, client, logger));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address() as AddressInfo;
+    const caller = new AbortController();
+    try {
+      const pending = fetch(`http://127.0.0.1:${address.port}/mcp`, {
+        method: "POST", signal: caller.signal,
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+          params: { name: "search_items", arguments: { queries: ["salad"] } } }),
+      }).then((response) => response.text());
+      const rejected = expect(pending).rejects.toBeDefined();
+      await vi.waitFor(() => expect(upstreamSignal).toBeDefined(), { interval: 5 });
+      caller.abort();
+      await rejected;
+      await vi.waitFor(() => expect(upstreamSignal?.aborted).toBe(true), { interval: 5 });
+    } finally {
+      caller.abort();
+      releaseUpstream?.();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("returns 503 for an enabled unhealthy monitor while preserving liveness", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "yandex-eats-readiness-"));
+    temporaryDirectories.push(directory);
+    const config = loadConfig({ NODE_ENV: "test", MCP_AUTH_MODE: "none", MCP_STATE_DIR: directory,
+      YANDEX_EATS_ENABLE_ORDER_MONITORING: "true" });
+    const logger = createLogger("silent");
+    const client = new YandexEatsClient(config, logger, () => Promise.reject(new Error("No upstream request expected")));
+    const monitor = createInactiveOrderMonitorService(config);
+    const health = monitor.getHealth();
+    monitor.getHealth = () => health;
+    const server = createServer(await createHttpApp(config, client, logger, monitor));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address() as AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    try {
+      let readiness = await fetch(`${base}/readyz`);
+      expect(readiness.status).toBe(503);
+      expect(await readiness.json()).toMatchObject({ status: "degraded", monitorHealthy: false });
+      expect((await fetch(`${base}/healthz`)).status).toBe(200);
+
+      health.monitorHealthy = true;
+      readiness = await fetch(`${base}/readyz`);
+      expect(readiness.status).toBe(200);
+      expect(await readiness.json()).toMatchObject({ status: "ready" });
+
+      health.monitorHealthy = false;
+      health.authExpired = true;
+      readiness = await fetch(`${base}/readyz`);
+      expect(readiness.status).toBe(503);
+      expect(await readiness.json()).toMatchObject({ authExpired: true });
+
+      health.monitorEnabled = false;
+      expect((await fetch(`${base}/readyz`)).status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("serves health and completes a stateless MCP handshake", async () => {
     const directory = await mkdtemp(join(tmpdir(), "yandex-eats-mcp-http-"));
     temporaryDirectories.push(directory);

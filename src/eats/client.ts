@@ -13,6 +13,7 @@ import type {
   NormalizedCart,
   NormalizedMenu,
   NormalizedMenuCategory,
+  NormalizedMenuItem,
   NormalizedPlace,
   NormalizedSearch,
 } from "./schemas.js";
@@ -108,7 +109,7 @@ export class YandexEatsClient {
     maxItemsPerPlace?: number | undefined;
     cursor?: string | undefined;
     includeUnavailable?: boolean | undefined;
-  }): Promise<NormalizedSearch> {
+  }, options: { signal?: AbortSignal } = {}): Promise<NormalizedSearch> {
     const location = this.requireLocation();
     const raw = await this.request("POST", ENDPOINTS.search, {
       body: {
@@ -117,6 +118,7 @@ export class YandexEatsClient {
         ...(input.cursor ? { pagination: { context: input.cursor } } : {}),
       },
       readLike: true,
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     return mapSearchResponse(
       raw,
@@ -140,10 +142,11 @@ export class YandexEatsClient {
     query?: string | undefined;
     categoryIds?: string[] | undefined;
     includeUnavailable?: boolean | undefined;
-  }): Promise<NormalizedMenu> {
+  }, options: { signal?: AbortSignal } = {}): Promise<NormalizedMenu> {
     const location = this.requireLocation();
     const raw = await this.request("GET", ENDPOINTS.menu(input.placeSlug), {
       query: { ...location, autoTranslate: false },
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     const menu = mapMenuResponse(raw, input.placeSlug);
     return filterMenu(menu, input);
@@ -176,10 +179,11 @@ export class YandexEatsClient {
     return mapCartResponse(raw);
   }
 
-  async listOrders(source?: string): Promise<RawOrdersEnvelope> {
+  async listOrders(source?: string, signal?: AbortSignal): Promise<RawOrdersEnvelope> {
     const raw = await this.request("POST", ENDPOINTS.orders, {
       authenticated: true,
       readLike: true,
+      ...(signal ? { signal } : {}),
       body: {
         goods_items_limit: 6,
         ...(source ? { source } : {}),
@@ -188,10 +192,11 @@ export class YandexEatsClient {
     return rawOrdersEnvelopeSchema.parse(raw);
   }
 
-  async refreshOrders(orderNrs: string[]): Promise<RawOrdersEnvelope> {
+  async refreshOrders(orderNrs: string[], signal?: AbortSignal): Promise<RawOrdersEnvelope> {
     const raw = await this.request("POST", ENDPOINTS.refreshOrders, {
       authenticated: true,
       readLike: true,
+      ...(signal ? { signal } : {}),
       body: { order_nrs: orderNrs, goods_items_limit: 6 },
     });
     return rawOrdersEnvelopeSchema.parse(raw);
@@ -206,10 +211,11 @@ export class YandexEatsClient {
     return rawOrderDetailsEnvelopeSchema.parse(raw);
   }
 
-  async getDesktopTracking(orderNr: string): Promise<RawTrackingEnvelope> {
+  async getDesktopTracking(orderNr: string, signal?: AbortSignal): Promise<RawTrackingEnvelope> {
     const raw = await this.request("GET", ENDPOINTS.desktopTracking, {
       authenticated: true,
       query: { order_nr: orderNr },
+      ...(signal ? { signal } : {}),
     });
     return rawTrackingEnvelopeSchema.parse(raw);
   }
@@ -224,53 +230,48 @@ export class YandexEatsClient {
     return this.runIdempotentMutation(input.operationId, input, () => this.mutationLock.run(input.placeSlug, async () => {
       await this.validateAddItems(input.placeSlug, input.items);
       const before = await this.getCart({ placeSlug: input.placeSlug });
-      try {
-        if (input.items.length > 1 && input.items.every((item) => item.options.length === 0)) {
-          await this.request("POST", ENDPOINTS.addCartItemsBulk, {
-            authenticated: true,
-            unsafeMutation: true,
-            query: this.cartQuery("catalog"),
-            body: {
-              items: input.items.map((item) => ({ item_id: numericId(item.itemId), quantity: item.quantity })),
-              place_slug: input.placeSlug,
-              place_business: input.placeBusiness,
-            },
-          });
-        } else {
-          if (input.items.length !== 1) {
-            throw new EatsError(
-              "VALIDATION_ERROR",
-              "Configured items must be added one at a time; only simple items support atomic bulk add.",
-            );
-          }
-          const item = input.items[0];
-          if (!item) throw new EatsError("VALIDATION_ERROR", "At least one item is required.");
-          await this.request("POST", ENDPOINTS.addCartItem, {
-            authenticated: true,
-            unsafeMutation: true,
-            query: this.cartQuery("catalog"),
-            body: {
-              quantity: item.quantity,
-              place_slug: input.placeSlug,
-              place_business: input.placeBusiness,
-              item_id: numericId(item.itemId),
-              item_options: item.options.map((group) => ({
-                group_id: numericId(group.groupId),
-                group_name: group.groupName,
-                group_options: group.selected.map((option) => numericId(option.optionId)),
-                modifiers: group.selected.map((option) => ({
-                  option_id: numericId(option.optionId),
-                  quantity: option.quantity,
-                })),
-              })),
-            },
-          });
+      if (input.items.length > 1 && input.items.every((item) => item.options.length === 0)) {
+        await this.request("POST", ENDPOINTS.addCartItemsBulk, {
+          authenticated: true,
+          unsafeMutation: true,
+          query: this.cartQuery("catalog"),
+          body: {
+            items: input.items.map((item) => ({ item_id: numericId(item.itemId), quantity: item.quantity })),
+            place_slug: input.placeSlug,
+            place_business: input.placeBusiness,
+          },
+        });
+      } else {
+        if (input.items.length !== 1) {
+          throw new EatsError(
+            "VALIDATION_ERROR",
+            "Configured items must be added one at a time; only simple items support atomic bulk add.",
+          );
         }
-      } catch (error) {
-        if (error instanceof EatsError && error.code === "MUTATION_STATUS_UNKNOWN") throw error;
-        throw error;
+        const item = input.items[0];
+        if (!item) throw new EatsError("VALIDATION_ERROR", "At least one item is required.");
+        await this.request("POST", ENDPOINTS.addCartItem, {
+          authenticated: true,
+          unsafeMutation: true,
+          query: this.cartQuery("catalog"),
+          body: {
+            quantity: item.quantity,
+            place_slug: input.placeSlug,
+            place_business: input.placeBusiness,
+            item_id: numericId(item.itemId),
+            item_options: item.options.map((group) => ({
+              group_id: numericId(group.groupId),
+              group_name: group.groupName,
+              group_options: group.selected.map((option) => numericId(option.optionId)),
+              modifiers: group.selected.map((option) => ({
+                option_id: numericId(option.optionId),
+                quantity: option.quantity,
+              })),
+            })),
+          },
+        });
       }
-      const after = await this.getCart({ placeSlug: input.placeSlug });
+      const after = await this.loadCartAfterMutation(input);
       return { operationId: input.operationId, before, after };
     }));
   }
@@ -279,19 +280,24 @@ export class YandexEatsClient {
     placeSlug: string;
     cartItemId: string;
     quantity: number;
-    options: SelectedOptionInput[];
+    options?: SelectedOptionInput[] | undefined;
     operationId: string;
   }): Promise<CartMutationResult> {
     this.requireMutations();
     return this.runIdempotentMutation(input.operationId, input, () => this.mutationLock.run(input.placeSlug, async () => {
       const before = await this.getCart({ placeSlug: input.placeSlug });
+      const existing = this.requireCartItem(before, input);
+      if (!existing.itemId) {
+        throw new EatsError("VALIDATION_ERROR", "The cart item has no menu item identifier; reload the cart before updating it.");
+      }
+      await this.validateItems(input.placeSlug, [{ itemId: existing.itemId, quantity: input.quantity, options: input.options }]);
       await this.request("PUT", ENDPOINTS.cartItem(input.cartItemId), {
         authenticated: true,
         unsafeMutation: true,
         query: this.cartQuery("cart"),
         body: {
           quantity: input.quantity,
-          item_options: input.options.map((group) => ({
+          ...(input.options !== undefined ? { item_options: input.options.map((group) => ({
             group_id: numericId(group.groupId),
             group_name: group.groupName,
             group_options: group.selected.map((option) => numericId(option.optionId)),
@@ -299,10 +305,10 @@ export class YandexEatsClient {
               option_id: numericId(option.optionId),
               quantity: option.quantity,
             })),
-          })),
+          })) } : {}),
         },
       });
-      const after = await this.getCart({ placeSlug: input.placeSlug });
+      const after = await this.loadCartAfterMutation(input);
       return { operationId: input.operationId, before, after };
     }));
   }
@@ -315,12 +321,13 @@ export class YandexEatsClient {
     this.requireMutations();
     return this.runIdempotentMutation(input.operationId, input, () => this.mutationLock.run(input.placeSlug, async () => {
       const before = await this.getCart({ placeSlug: input.placeSlug });
+      this.requireCartItem(before, input);
       await this.request("DELETE", ENDPOINTS.cartItem(input.cartItemId), {
         authenticated: true,
         unsafeMutation: true,
         query: this.cartQuery("cart"),
       });
-      const after = await this.getCart({ placeSlug: input.placeSlug });
+      const after = await this.loadCartAfterMutation(input);
       return { operationId: input.operationId, before, after };
     }));
   }
@@ -345,48 +352,103 @@ export class YandexEatsClient {
   }
 
   private async validateAddItems(placeSlug: string, requestedItems: AddItemInput[]): Promise<void> {
+    if (requestedItems.length === 0) throw new EatsError("VALIDATION_ERROR", "At least one item is required.");
+    await this.validateItems(placeSlug, requestedItems);
+  }
+
+  private async loadCartAfterMutation(input: { placeSlug: string; operationId: string }): Promise<NormalizedCart> {
+    try {
+      return await this.getCart({ placeSlug: input.placeSlug });
+    } catch (error) {
+      throw new EatsError(
+        "MUTATION_STATUS_UNKNOWN",
+        "The cart mutation was accepted, but its resulting cart could not be loaded. Do not repeat the mutation; call get_cart to reconcile state.",
+        {
+          cause: error,
+          details: { operationId: input.operationId, placeSlug: input.placeSlug, mutationAccepted: true, reconciliationRequired: true },
+        },
+      );
+    }
+  }
+
+  private requireCartItem(cart: NormalizedCart, input: { placeSlug: string; cartItemId: string }): NormalizedCart["items"][number] {
+    const item = cart.items.find((candidate) => candidate.cartItemId === input.cartItemId);
+    if (!item || (cart.placeSlug !== undefined && cart.placeSlug !== input.placeSlug)) {
+      throw new EatsError("VALIDATION_ERROR", "The cart item does not belong to the requested restaurant cart.");
+    }
+    return item;
+  }
+
+  private async validateItems(
+    placeSlug: string,
+    requestedItems: Array<{ itemId: string; quantity: number; options?: SelectedOptionInput[] | undefined }>,
+  ): Promise<void> {
     const menu = await this.getMenu({ placeSlug, includeUnavailable: true });
     const menuItems = flattenMenuItems(menu.categories);
+    const quantities = new Map<string, number>();
+    for (const requested of requestedItems) {
+      if (!Number.isSafeInteger(requested.quantity) || requested.quantity < 1) {
+        throw new EatsError("VALIDATION_ERROR", "Item quantities must be positive integers.");
+      }
+      quantities.set(requested.itemId, (quantities.get(requested.itemId) ?? 0) + requested.quantity);
+    }
     for (const requested of requestedItems) {
       const menuItem = menuItems.find((item) => item.itemId === requested.itemId);
       if (!menuItem) {
         throw new EatsError("VALIDATION_ERROR", `Item ${requested.itemId} was not found in the current menu.`);
       }
-      if (!menuItem.available) {
+      if (!menuItem.available || (menuItem.inStock !== undefined && menuItem.inStock !== null && menuItem.inStock <= 0)) {
         throw new EatsError("PLACE_UNAVAILABLE", `${menuItem.name} is currently unavailable.`);
       }
-      const selectedGroups = new Map(requested.options.map((group) => [group.groupId, group]));
-      for (const group of menuItem.optionGroups) {
-        const selected = selectedGroups.get(group.groupId);
-        if (group.required && !selected) {
-          throw new EatsError("REQUIRES_CONFIGURATION", `${menuItem.name} requires an option for ${group.name}.`, {
-            details: {
-              itemId: menuItem.itemId,
-              groupId: group.groupId,
-              groupName: group.name,
-              minSelected: group.minSelected,
-              maxSelected: group.maxSelected,
-              options: group.options.map((option) => ({ optionId: option.optionId, name: option.name })),
-            },
-          });
-        }
-        if (!selected) continue;
-        const selectedCount = selected.selected.reduce((sum, option) => sum + option.quantity, 0);
-        if (selectedCount < group.minSelected || selectedCount > group.maxSelected) {
-          throw new EatsError(
-            "VALIDATION_ERROR",
-            `${group.name} requires between ${group.minSelected} and ${group.maxSelected} selections.`,
-          );
-        }
-        const validOptionIds = new Set(group.options.map((option) => option.optionId));
-        if (selected.selected.some((option) => !validOptionIds.has(option.optionId))) {
-          throw new EatsError("VALIDATION_ERROR", `An invalid option was provided for ${group.name}.`);
-        }
+      if (menuItem.inStock !== undefined && menuItem.inStock !== null && (quantities.get(requested.itemId) ?? 0) > menuItem.inStock) {
+        throw new EatsError("VALIDATION_ERROR", `The requested quantity of ${menuItem.name} exceeds its current stock.`);
       }
-      const validGroupIds = new Set(menuItem.optionGroups.map((group) => group.groupId));
-      if (requested.options.some((group) => !validGroupIds.has(group.groupId))) {
-        throw new EatsError("VALIDATION_ERROR", `An invalid option group was provided for ${menuItem.name}.`);
+      if (requested.options !== undefined) this.validateOptions(menuItem, requested.options);
+    }
+  }
+
+  private validateOptions(menuItem: NormalizedMenuItem, options: SelectedOptionInput[]): void {
+    const selectedGroups = new Map(options.map((group) => [group.groupId, group]));
+    if (selectedGroups.size !== options.length) {
+      throw new EatsError("VALIDATION_ERROR", "Option groups must not be repeated.");
+    }
+    for (const group of menuItem.optionGroups) {
+      const selected = selectedGroups.get(group.groupId);
+      const minimum = Math.max(group.minSelected, group.required ? 1 : 0);
+      if (minimum > 0 && (!selected || selected.selected.length === 0)) {
+        throw new EatsError("REQUIRES_CONFIGURATION", `${menuItem.name} requires an option for ${group.name}.`, {
+          details: {
+            itemId: menuItem.itemId,
+            groupId: group.groupId,
+            groupName: group.name,
+            minSelected: group.minSelected,
+            maxSelected: group.maxSelected,
+            options: group.options.map((option) => ({ optionId: option.optionId, name: option.name })),
+          },
+        });
       }
+      if (!selected) continue;
+      if (new Set(selected.selected.map((option) => option.optionId)).size !== selected.selected.length) {
+        throw new EatsError("VALIDATION_ERROR", `Options must not be repeated in ${group.name}; use quantity instead.`);
+      }
+      if (selected.selected.some((option) => !Number.isSafeInteger(option.quantity) || option.quantity < 1)) {
+        throw new EatsError("VALIDATION_ERROR", "Option quantities must be positive integers.");
+      }
+      const selectedCount = selected.selected.reduce((sum, option) => sum + option.quantity, 0);
+      if (selectedCount < minimum || selectedCount > group.maxSelected) {
+        throw new EatsError(
+          "VALIDATION_ERROR",
+          `${group.name} requires between ${minimum} and ${group.maxSelected} selections.`,
+        );
+      }
+      const validOptionIds = new Set(group.options.map((option) => option.optionId));
+      if (selected.selected.some((option) => !validOptionIds.has(option.optionId))) {
+        throw new EatsError("VALIDATION_ERROR", `An invalid option was provided for ${group.name}.`);
+      }
+    }
+    const validGroupIds = new Set(menuItem.optionGroups.map((group) => group.groupId));
+    if (options.some((group) => !validGroupIds.has(group.groupId))) {
+      throw new EatsError("VALIDATION_ERROR", `An invalid option group was provided for ${menuItem.name}.`);
     }
   }
 
@@ -409,7 +471,15 @@ export class YandexEatsClient {
       }
       return existing.result;
     }
-    const result = operation();
+    const result = operation().catch((error: unknown) => {
+      if (error instanceof EatsError && error.code === "MUTATION_STATUS_UNKNOWN") {
+        throw new EatsError(error.code, error.message, {
+          cause: error,
+          details: { ...error.details, operationId, placeSlug: input.placeSlug, reconciliationRequired: true },
+        });
+      }
+      throw error;
+    });
     this.operations.set(operationId, { fingerprint, createdAt: now, result });
     return result;
   }
@@ -435,6 +505,7 @@ export class YandexEatsClient {
       authenticated?: boolean;
       readLike?: boolean;
       unsafeMutation?: boolean;
+      signal?: AbortSignal;
     } = {},
   ): Promise<unknown> {
     if (!path.startsWith("/")) throw new Error("Upstream path must be absolute");
@@ -448,6 +519,7 @@ export class YandexEatsClient {
     const maxAttempts = method === "GET" || options.readLike ? 2 : 1;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      options.signal?.throwIfAborted();
       const headers: Record<string, string> = {
         Accept: "application/json",
         "Accept-Language": this.config.eats.locale,
@@ -463,14 +535,18 @@ export class YandexEatsClient {
       if (options.body !== undefined) headers["Content-Type"] = "application/json";
       const startedAt = performance.now();
       try {
+        const timeoutSignal = AbortSignal.timeout(this.config.eats.timeoutMs);
+        const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+        signal.throwIfAborted();
         const response = await this.fetchImplementation(url, {
           method,
           headers,
           ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
           redirect: "error",
-          signal: AbortSignal.timeout(this.config.eats.timeoutMs),
+          signal,
         });
         await this.session.absorbResponse(response.headers);
+        signal.throwIfAborted();
         const requestId = response.headers.get("x-yarequestid") ?? response.headers.get("x-yatraceid");
         this.logger.info(
           {
@@ -521,10 +597,16 @@ export class YandexEatsClient {
         if (response.status === 204) return null;
         const contentType = response.headers.get("content-type") ?? "";
         if (!contentType.includes("json")) {
+          if (options.unsafeMutation) {
+            throw new EatsError("MUTATION_STATUS_UNKNOWN", "The cart mutation returned an unreadable response; call get_cart to reconcile state.");
+          }
           throw new EatsError("UPSTREAM_BAD_RESPONSE", "Yandex Eats returned a non-JSON response.");
         }
-        return await response.json();
+        const body: unknown = await response.json();
+        signal.throwIfAborted();
+        return body;
       } catch (error) {
+        options.signal?.throwIfAborted();
         if (error instanceof EatsError) throw error;
         const timedOut = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
         if (options.unsafeMutation) {
@@ -586,9 +668,12 @@ function numericId(value: string): number | string {
   return /^\d+$/.test(value) ? Number(value) : value;
 }
 
-function flattenMenuItems(categories: NormalizedMenuCategory[]): NormalizedMenu["categories"][number]["items"] {
-  return categories.flatMap((category) => [
-    ...category.items,
-    ...flattenMenuItems(category.categories),
-  ]);
+function flattenMenuItems(categories: NormalizedMenuCategory[], parentAvailable = true): NormalizedMenuItem[] {
+  return categories.flatMap((category) => {
+    const available = parentAvailable && category.available;
+    return [
+      ...category.items.map((item) => ({ ...item, available: available && item.available })),
+      ...flattenMenuItems(category.categories, available),
+    ];
+  });
 }

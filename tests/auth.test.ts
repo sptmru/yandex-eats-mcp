@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Request, Response } from "express";
@@ -119,7 +119,105 @@ describe("MCP authentication", () => {
       }),
     );
   });
+
+  it("recovers after a failed save without exposing or later persisting the failed registration", async () => {
+    const fixture = await oauthFixture();
+    const restore = await blockOAuthSave(fixture.directory);
+    const failedClient = {
+      client_id: "failed-client",
+      redirect_uris: fixture.client.redirect_uris,
+      token_endpoint_auth_method: "none" as const,
+    };
+    await expect(fixture.provider.clientsStore.registerClient?.(failedClient)).rejects.toThrow();
+    expect(await fixture.provider.clientsStore.getClient("failed-client")).toBeUndefined();
+    await restore();
+
+    const registered = await fixture.provider.clientsStore.registerClient?.({
+      redirect_uris: fixture.client.redirect_uris,
+      token_endpoint_auth_method: "none",
+    });
+    expect(registered?.client_id).toBeTruthy();
+    const saved = JSON.parse(await readFile(join(fixture.directory, "oauth.json"), "utf8")) as { clients: Record<string, unknown> };
+    expect(saved.clients[fixture.client.client_id]).toBeDefined();
+    expect(saved.clients["failed-client"]).toBeUndefined();
+    expect(Object.keys(saved.clients)).toHaveLength(2);
+  });
+
+  it.each(["{broken-json", '{"clients":[],"tokens":{}}', '{"clients":{},"tokens":{"hash":{"kind":"access"}}}'])(
+    "preserves corrupt OAuth state instead of replacing it (%s)",
+    async (contents) => {
+      const directory = await mkdtemp(join(tmpdir(), "yandex-eats-mcp-oauth-invalid-"));
+      temporaryDirectories.push(directory);
+      const statePath = join(directory, "oauth.json");
+      await writeFile(statePath, contents);
+      const provider = new SingleUserOAuthProvider(directory, "owner-password", new URL("https://eats-mcp.example.com/mcp"), createLogger("silent"));
+      await expect(provider.initialize()).rejects.toThrow("existing file was preserved");
+      expect(await readFile(statePath, "utf8")).toBe(contents);
+    },
+  );
+
+  it("keeps authorization codes usable after a failed token save and consumes them exactly once", async () => {
+    const fixture = await oauthFixture();
+    const code = await approveCode(fixture);
+    const restore = await blockOAuthSave(fixture.directory);
+    await expect(fixture.provider.exchangeAuthorizationCode(fixture.client, code)).rejects.toThrow();
+    await expect(fixture.provider.challengeForAuthorizationCode(fixture.client, code)).resolves.toBe(fixture.params.codeChallenge);
+    await restore();
+    const exchanges = await Promise.allSettled([
+      fixture.provider.exchangeAuthorizationCode(fixture.client, code),
+      fixture.provider.exchangeAuthorizationCode(fixture.client, code),
+    ]);
+    expect(exchanges.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(exchanges.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const saved = JSON.parse(await readFile(join(fixture.directory, "oauth.json"), "utf8")) as { tokens: Record<string, unknown> };
+    expect(Object.keys(saved.tokens)).toHaveLength(2);
+  });
+
+  it("preserves refresh tokens on a failed rotation and serializes concurrent rotations", async () => {
+    const fixture = await oauthFixture();
+    const code = await approveCode(fixture);
+    const pair = await fixture.provider.exchangeAuthorizationCode(fixture.client, code);
+    if (!pair.refresh_token) throw new Error("Missing refresh token");
+    const restore = await blockOAuthSave(fixture.directory);
+    await expect(fixture.provider.exchangeRefreshToken(fixture.client, pair.refresh_token)).rejects.toThrow();
+    await expect(fixture.provider.verifyAccessToken(pair.access_token)).resolves.toMatchObject({ clientId: fixture.client.client_id });
+    await restore();
+
+    const exchanges = await Promise.allSettled([
+      fixture.provider.exchangeRefreshToken(fixture.client, pair.refresh_token),
+      fixture.provider.exchangeRefreshToken(fixture.client, pair.refresh_token),
+    ]);
+    expect(exchanges.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(exchanges.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const restored = new SingleUserOAuthProvider(fixture.directory, "owner-password", fixture.params.resource, createLogger("silent"));
+    await restored.initialize();
+    const successful = exchanges.find((result) => result.status === "fulfilled");
+    if (successful?.status !== "fulfilled") throw new Error("Missing successful rotation");
+    await expect(restored.verifyAccessToken(successful.value.access_token)).resolves.toMatchObject({ clientId: fixture.client.client_id });
+  });
 });
+
+async function blockOAuthSave(directory: string): Promise<() => Promise<void>> {
+  const path = join(directory, "oauth.json");
+  const backup = join(directory, "oauth.saved.json");
+  await rename(path, backup);
+  await mkdir(path);
+  return async () => {
+    await rm(path, { recursive: true });
+    await rename(backup, path);
+  };
+}
+
+async function approveCode(fixture: Awaited<ReturnType<typeof oauthFixture>>): Promise<string> {
+  const authorization = responseCapture();
+  await fixture.provider.authorize(fixture.client, fixture.params, authorization.response);
+  const pending = /name="pending" value="([^"]+)"/.exec(String(authorization.capture.body))?.[1];
+  const approval = responseCapture();
+  await fixture.provider.approve({ body: { pending, password: "owner-password" }, ip: "127.0.0.1" } as Request, approval.response);
+  const code = new URL(approval.capture.location ?? "https://invalid.test").searchParams.get("code");
+  if (!code) throw new Error("Missing authorization code");
+  return code;
+}
 
 type CapturedLog = {
   level: "info" | "warn";
@@ -167,6 +265,7 @@ function responseCapture(): {
 }
 
 async function oauthFixture(): Promise<{
+  directory: string;
   provider: SingleUserOAuthProvider;
   client: NonNullable<Awaited<ReturnType<NonNullable<SingleUserOAuthProvider["clientsStore"]["registerClient"]>>>>;
   params: {
@@ -192,6 +291,7 @@ async function oauthFixture(): Promise<{
   if (!client) throw new Error("OAuth client registration is unavailable");
   records.length = 0;
   return {
+    directory,
     provider,
     client,
     params: {

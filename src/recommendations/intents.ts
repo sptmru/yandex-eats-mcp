@@ -58,7 +58,8 @@ export function expandSearchIntents(input: {
   maxIntents?: number;
 }): string[] {
   const query = input.query.trim();
-  const { affirmativeText, excludedTerms } = parseNegation(query);
+  const { affirmativeText } = parseNegation(query);
+  const { excludedTerms } = parseRecommendationIntentGroups(query);
   const language = CYRILLIC.test(query) ? "ru" : "en";
   const explicit = [
     ...(input.categories ?? []),
@@ -99,7 +100,8 @@ export function expandSearchIntents(input: {
   const contentTokens = tokenize(affirmativeText);
   if (intents.length === 0 && contentTokens.length > 0) add(intents, affirmativeText);
   if (intents.length === 0) add(intents, language === "ru" ? "еда" : "food");
-  return intents.slice(0, input.maxIntents ?? 6);
+  return intents.filter((intent) => !canonicalValues(intent).some((term) => excluded.has(term)))
+    .slice(0, input.maxIntents ?? 6);
 }
 
 function add(values: string[], value: string): void {
@@ -147,14 +149,27 @@ export function parseRecommendationIntentGroups(query: string): {
   sameRestaurant: boolean;
   excludedTerms: string[];
 } {
-  const excludedTerms = extractExcludedTerms(query);
   const sameRestaurant = /(same restaurant|one restaurant|one place|из одного (?:ресторана|места)|в одном (?:ресторане|месте))/iu.test(query);
-  const afterColon = query.includes(":") ? query.slice(query.indexOf(":") + 1) : query;
-  const possibleGroups = afterColon.split(/[,;]+/u).map((entry) => entry.trim()).filter(Boolean);
+  const colon = query.indexOf(":");
+  const afterColon = colon >= 0 ? query.slice(colon + 1) : query;
+  const globalClauses: string[] = colon >= 0 ? [query.slice(0, colon)] : [];
+  // A separate negative sentence or an explicit "for everyone" clause applies
+  // to the whole order. Inline negatives stay with the requesting person.
+  const groupText = afterColon.replace(
+    /(^|[.!?]\s*)((?:без|without|avoid|avoiding|excluding|исключая|не|not|no)\s+[^.!?]*)|(?:^|[,;.!?]\s*)((?:для всех|для обоих|всем|обоим|for everyone|for both|everyone|both)\s+(?:без|without|avoid|avoiding|excluding|исключая|не|not|no)\s+[^.!?]*)/giu,
+    (_match, prefix: string | undefined, sentence: string | undefined, shared: string | undefined) => {
+      globalClauses.push(sentence ?? shared ?? "");
+      return prefix ?? "";
+    },
+  );
+  const possibleGroups = groupText.split(/[,;]+/u).map((entry) => entry.trim()).filter(Boolean);
   const hasPersonMarkers = possibleGroups.filter(hasPersonMarker).length >= 1 && possibleGroups.length >= 2;
   const implicitSameRestaurantGroups = sameRestaurant && possibleGroups.length >= 2 &&
     !/\s+(?:или|либо|or)\s+|\s*\/\s*/iu.test(afterColon);
   const hasGroupBoundaries = hasPersonMarkers || implicitSameRestaurantGroups;
+  const excludedTerms = hasGroupBoundaries
+    ? unique(globalClauses.flatMap(extractExcludedTerms))
+    : extractExcludedTerms(query);
   const segments = hasPersonMarkers
     ? mergePersonSegments(possibleGroups)
     : implicitSameRestaurantGroups ? possibleGroups : [afterColon.trim()];
@@ -175,7 +190,7 @@ export function parseRecommendationIntentGroups(query: string): {
       id: `group-${index + 1}`,
       label,
       alternatives: propagateSharedRequiredTerm(parsedAlternatives),
-      excludedTerms,
+      excludedTerms: unique([...excludedTerms, ...extractExcludedTerms(request)]),
     };
   }).filter((group) => group.alternatives.length > 0);
 

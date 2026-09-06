@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 import type { YandexEatsClient } from "../eats/client.js";
+import { EatsError } from "../mcp/errors.js";
 import type { NormalizedMenu, NormalizedMenuCategory, NormalizedSearch } from "../eats/schemas.js";
 import { diversifyResults } from "./diversify.js";
 import {
@@ -37,105 +38,129 @@ export type RecommendationOptions = {
   maxPagesPerQuery: number;
   menuConcurrency: number;
   menuCacheTtlMs: number;
+  deadlineMs?: number;
+  searchConcurrency?: number;
+  menuCacheMaxEntries?: number;
 };
 
-const DEFAULT_OPTIONS: RecommendationOptions = {
+const DEFAULT_OPTIONS: Required<RecommendationOptions> = {
   maxIntents: 6,
   maxMenus: 12,
   maxPagesPerQuery: 2,
   menuConcurrency: 3,
   menuCacheTtlMs: 5 * 60_000,
+  deadlineMs: 45_000,
+  searchConcurrency: 3,
+  menuCacheMaxEntries: 100,
+};
+
+type MenuRequest = {
+  controller: AbortController;
+  promise: Promise<NormalizedMenu>;
+  subscribers: number;
+  settled: boolean;
 };
 
 export class RecommendationService {
   private readonly menuCache = new Map<string, { loadedAt: number; menu: NormalizedMenu }>();
+  private readonly menuRequests = new Map<string, MenuRequest>();
+  private readonly options: Required<RecommendationOptions>;
 
   constructor(
     private readonly client: YandexEatsClient,
     private readonly preferences: FoodPreferenceStore,
     private readonly logger: Logger,
-    private readonly options: RecommendationOptions = DEFAULT_OPTIONS,
-  ) {}
+    options: RecommendationOptions = DEFAULT_OPTIONS,
+  ) {
+    this.options = { ...DEFAULT_OPTIONS, ...options };
+    for (const [name, value] of Object.entries(this.options)) {
+      if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+    }
+  }
 
   async initialize(): Promise<void> {
     await this.preferences.initialize();
   }
 
-  async searchItems(input: SearchItemsInput): Promise<FoodSearchResult> {
-    const queries = uniqueQueries(input.queries).slice(0, this.options.maxIntents);
-    const gathered = await this.gatherCandidates({
-      queries,
-      maxPlaces: Math.min(input.maxPlaces ?? this.options.maxMenus, this.options.maxMenus),
-      maxPagesPerQuery: Math.min(input.maxPagesPerQuery ?? this.options.maxPagesPerQuery, this.options.maxPagesPerQuery),
-    });
-    const maxItems = input.maxItems ?? 50;
-    const scored = gathered.candidates
-      .map((candidate) => scoreSearchCandidate(candidate, queries))
-      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
-    const candidates = input.deduplicate === false ? scored : deduplicateResults(scored);
-    const results = rankSearchResults(candidates, maxItems);
+  async searchItems(input: SearchItemsInput, signal?: AbortSignal): Promise<FoodSearchResult> {
+    return await withDeadline(signal, this.options.deadlineMs, async (deadlineSignal) => {
+      const queries = uniqueQueries(input.queries).slice(0, this.options.maxIntents);
+      const gathered = await this.gatherCandidates({
+        queries,
+        maxPlaces: Math.min(input.maxPlaces ?? this.options.maxMenus, this.options.maxMenus),
+        maxPagesPerQuery: Math.min(input.maxPagesPerQuery ?? this.options.maxPagesPerQuery, this.options.maxPagesPerQuery),
+      }, deadlineSignal, signal);
+      const maxItems = input.maxItems ?? 50;
+      const scored = gathered.candidates
+        .map((candidate) => scoreSearchCandidate(candidate, queries))
+        .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+      const candidates = input.deduplicate === false ? scored : deduplicateResults(scored);
+      const results = rankSearchResults(candidates, maxItems);
 
-    return {
-      queries,
-      candidatePlaces: gathered.candidatePlaces,
-      shortlistedPlaces: gathered.shortlistedPlaces,
-      shortlistReasons: gathered.shortlistReasons,
-      menusLoaded: gathered.menusLoaded,
-      results,
-      warnings: gathered.warnings,
-    };
+      return {
+        queries,
+        candidatePlaces: gathered.candidatePlaces,
+        shortlistedPlaces: gathered.shortlistedPlaces,
+        shortlistReasons: gathered.shortlistReasons,
+        menusLoaded: gathered.menusLoaded,
+        results,
+        warnings: gathered.warnings,
+      };
+    });
   }
 
-  async recommend(input: RecommendFoodInput): Promise<RecommendationResult> {
-    const parsedIntent = parseRecommendationIntentGroups(input.query);
-    const sameRestaurant = input.sameRestaurant ?? parsedIntent.sameRestaurant;
-    const searchIntents = expandSearchIntents({
-      query: input.query,
-      ...(input.categories ? { categories: input.categories } : {}),
-      ...(input.cuisines ? { cuisines: input.cuisines } : {}),
-      ...(input.proteins ? { proteins: input.proteins } : {}),
-      ...(input.cookingMethods ? { cookingMethods: input.cookingMethods } : {}),
-      ...(input.anyOf ? { anyOf: input.anyOf } : {}),
-      ...(input.prefer ? { prefer: input.prefer } : {}),
-      maxIntents: this.options.maxIntents,
-    });
-    const gathered = await this.gatherCandidates({
-      queries: searchIntents,
-      maxPlaces: this.options.maxMenus,
-      maxPagesPerQuery: this.options.maxPagesPerQuery,
-    });
-    const preferences = await this.preferences.list();
-    const scored = gathered.candidates
-      .map((candidate) => applyIntentGroups(candidate, parsedIntent.groups))
-      .map((candidate) => scoreCandidate(candidate, input, preferences))
-      .filter((candidate): candidate is FoodResult => candidate !== undefined)
-      .sort((a, b) => b.score - a.score);
-    const limit = input.limit ?? 10;
-    const deduplicated = deduplicateResults(scored);
-    const grouped = sameRestaurant && parsedIntent.groups.length > 1
-      ? selectSameRestaurantResults(deduplicated, parsedIntent.groups, limit)
-      : undefined;
-    const results = grouped?.results ?? diversifyResults(deduplicated, {
-        limit,
-        maxPerRestaurant: input.maxPerRestaurant ?? 2,
-        maxPerCategory: input.maxPerCategory ?? 2,
-        exploration: input.exploration ?? 0.35,
+  async recommend(input: RecommendFoodInput, signal?: AbortSignal): Promise<RecommendationResult> {
+    return await withDeadline(signal, this.options.deadlineMs, async (deadlineSignal) => {
+      const preferences = await waitForSignal(this.preferences.list(), deadlineSignal);
+      const parsedIntent = parseRecommendationIntentGroups(input.query);
+      const sameRestaurant = input.sameRestaurant ?? parsedIntent.sameRestaurant;
+      const searchIntents = expandSearchIntents({
+        query: input.query,
+        ...(input.categories ? { categories: input.categories } : {}),
+        ...(input.cuisines ? { cuisines: input.cuisines } : {}),
+        ...(input.proteins ? { proteins: input.proteins } : {}),
+        ...(input.cookingMethods ? { cookingMethods: input.cookingMethods } : {}),
+        ...(input.anyOf ? { anyOf: input.anyOf } : {}),
+        ...(input.prefer ? { prefer: input.prefer } : {}),
+        maxIntents: this.options.maxIntents,
       });
+      const gathered = await this.gatherCandidates({
+        queries: searchIntents,
+        maxPlaces: this.options.maxMenus,
+        maxPagesPerQuery: this.options.maxPagesPerQuery,
+      }, deadlineSignal, signal);
+      const scored = gathered.candidates
+        .map((candidate) => applyIntentGroups(candidate, parsedIntent.groups))
+        .map((candidate) => scoreCandidate(candidate, input, preferences))
+        .filter((candidate): candidate is FoodResult => candidate !== undefined)
+        .sort((a, b) => b.score - a.score);
+      const limit = input.limit ?? 10;
+      const deduplicated = deduplicateResults(scored);
+      const grouped = sameRestaurant
+        ? selectSameRestaurantResults(deduplicated, parsedIntent.groups, limit)
+        : undefined;
+      const results = sameRestaurant ? grouped?.results ?? [] : diversifyResults(deduplicated, {
+          limit,
+          maxPerRestaurant: input.maxPerRestaurant ?? 2,
+          maxPerCategory: input.maxPerCategory ?? 2,
+          exploration: input.exploration ?? 0.35,
+        });
 
-    return {
-      query: input.query,
-      searchIntents,
-      intentGroups: parsedIntent.groups,
-      excludedTerms: parsedIntent.excludedTerms,
-      sameRestaurant,
-      ...(grouped?.restaurantCoverage ? { restaurantCoverage: grouped.restaurantCoverage } : {}),
-      candidatePlaces: gathered.candidatePlaces,
-      shortlistedPlaces: gathered.shortlistedPlaces,
-      shortlistReasons: gathered.shortlistReasons,
-      menusLoaded: gathered.menusLoaded,
-      results,
-      warnings: gathered.warnings,
-    };
+      return {
+        query: input.query,
+        searchIntents,
+        intentGroups: parsedIntent.groups,
+        excludedTerms: parsedIntent.excludedTerms,
+        sameRestaurant,
+        ...(grouped?.restaurantCoverage ? { restaurantCoverage: grouped.restaurantCoverage } : {}),
+        candidatePlaces: gathered.candidatePlaces,
+        shortlistedPlaces: gathered.shortlistedPlaces,
+        shortlistReasons: gathered.shortlistReasons,
+        menusLoaded: gathered.menusLoaded,
+        results,
+        warnings: gathered.warnings,
+      };
+    });
   }
 
   async recordFeedback(input: FoodFeedbackInput) {
@@ -150,7 +175,7 @@ export class RecommendationService {
     queries: string[];
     maxPlaces: number;
     maxPagesPerQuery: number;
-  }): Promise<{
+  }, deadlineSignal: AbortSignal, signal?: AbortSignal): Promise<{
     candidates: DishCandidate[];
     candidatePlaces: number;
     shortlistedPlaces: number;
@@ -159,40 +184,64 @@ export class RecommendationService {
     warnings: string[];
   }> {
     const places = new Map<string, PlaceEvidence>();
+    const warnings: string[] = [];
+    const searches = new Map<string, NormalizedSearch[]>();
+    // Keep a menu verification budget even when an individual search hangs.
+    await withDeadline(deadlineSignal, Math.max(1, Math.floor(this.options.deadlineMs * 0.6)), async (searchSignal) => {
+      await mapLimit(input.queries, this.options.searchConcurrency, async (query) => {
+        if (searchSignal.aborted) return;
+        const pages: NormalizedSearch[] = [];
+        searches.set(query, pages);
+        let cursor: string | undefined;
+        try {
+          for (let page = 0; page < input.maxPagesPerQuery; page += 1) {
+            searchSignal.throwIfAborted();
+            const search = await waitForSignal(this.client.search({
+              query,
+              maxPlaces: 50,
+              maxItemsPerPlace: 25,
+              ...(cursor ? { cursor } : {}),
+            }, { signal: searchSignal }), searchSignal);
+            pages.push(search);
+            cursor = search.cursor;
+            if (!cursor) break;
+          }
+        } catch (error) {
+          signal?.throwIfAborted();
+          if (!isPartialResultError(error)) throw error;
+          this.logger.warn({ err: error, query }, "Recommendation search failed");
+          warnings.push(`Could not complete search for ${query}; results may be incomplete.`);
+        }
+      });
+      if (searchSignal.aborted) warnings.push("Search time budget reached; results may be incomplete.");
+    });
+    // Merge in query order so network completion order cannot change tie breaks.
     for (const query of input.queries) {
-      let cursor: string | undefined;
-      for (let page = 0; page < input.maxPagesPerQuery; page += 1) {
-        const search = await this.client.search({
-          query,
-          maxPlaces: 50,
-          maxItemsPerPlace: 25,
-          ...(cursor ? { cursor } : {}),
-        });
-        mergeSearchEvidence(places, search, query);
-        cursor = search.cursor;
-        if (!cursor) break;
-      }
+      for (const search of searches.get(query) ?? []) mergeSearchEvidence(places, search, query);
     }
 
     const shortlist = selectDiversePlaces(
       [...places.values()],
       input.queries,
-      Math.min(places.size, input.maxPlaces * 2),
+      Math.min(places.size, input.maxPlaces),
     );
-    const rankedPlaces = shortlist.places.slice(0, input.maxPlaces);
-    const warnings: string[] = [];
+    const rankedPlaces = shortlist.places;
     let menusLoaded = 0;
     const menuResults = await mapLimit(rankedPlaces, this.options.menuConcurrency, async (place) => {
       try {
-        const menu = await this.loadMenu(place.placeSlug);
+        if (deadlineSignal.aborted) return undefined;
+        const menu = await this.loadMenu(place.placeSlug, deadlineSignal);
         menusLoaded += 1;
         return { place, menu };
       } catch (error) {
+        signal?.throwIfAborted();
+        if (!isPartialResultError(error)) throw error;
         this.logger.warn({ err: error, placeSlug: place.placeSlug }, "Recommendation menu load failed");
         warnings.push(`Could not load the current menu for ${place.name}.`);
         return undefined;
       }
     });
+    if (deadlineSignal.aborted) warnings.push("Recommendation deadline reached; results may be incomplete.");
 
     const candidates: DishCandidate[] = [];
     for (const result of menuResults) {
@@ -271,13 +320,96 @@ export class RecommendationService {
     };
   }
 
-  private async loadMenu(placeSlug: string): Promise<NormalizedMenu> {
+  private async loadMenu(placeSlug: string, signal: AbortSignal): Promise<NormalizedMenu> {
+    signal.throwIfAborted();
+    const now = Date.now();
+    for (const [slug, cached] of this.menuCache) {
+      if (now - cached.loadedAt >= this.options.menuCacheTtlMs) this.menuCache.delete(slug);
+    }
     const cached = this.menuCache.get(placeSlug);
-    if (cached && Date.now() - cached.loadedAt < this.options.menuCacheTtlMs) return cached.menu;
-    const menu = await this.client.getMenu({ placeSlug });
-    this.menuCache.set(placeSlug, { loadedAt: Date.now(), menu });
-    return menu;
+    if (cached) {
+      this.menuCache.delete(placeSlug);
+      this.menuCache.set(placeSlug, cached);
+      return cached.menu;
+    }
+    let request = this.menuRequests.get(placeSlug);
+    if (!request) {
+      const controller = new AbortController();
+      const created: MenuRequest = {
+        controller,
+        subscribers: 0,
+        settled: false,
+        promise: Promise.resolve().then(async () => {
+          controller.signal.throwIfAborted();
+          const menu = await this.client.getMenu({ placeSlug }, { signal: controller.signal });
+          controller.signal.throwIfAborted();
+          this.menuCache.set(placeSlug, { loadedAt: Date.now(), menu });
+          while (this.menuCache.size > this.options.menuCacheMaxEntries) {
+            const oldest = this.menuCache.keys().next().value;
+            if (oldest !== undefined) this.menuCache.delete(oldest);
+          }
+          return menu;
+        }).finally(() => {
+          created.settled = true;
+          if (this.menuRequests.get(placeSlug) === created) this.menuRequests.delete(placeSlug);
+        }),
+      };
+      this.menuRequests.set(placeSlug, created);
+      request = created;
+    }
+    request.subscribers += 1;
+    try {
+      return await waitForSignal(request.promise, signal);
+    } finally {
+      request.subscribers -= 1;
+      if (request.subscribers === 0 && !request.settled) {
+        if (this.menuRequests.get(placeSlug) === request) this.menuRequests.delete(placeSlug);
+        request.controller.abort(new DOMException("No active menu subscribers", "AbortError"));
+      }
+    }
   }
+}
+
+class RecommendationDeadlineError extends Error {
+  constructor() {
+    super("Recommendation time budget reached");
+  }
+}
+
+async function withDeadline<T>(
+  parent: AbortSignal | undefined,
+  milliseconds: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  parent?.throwIfAborted();
+  const controller = new AbortController();
+  const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(new RecommendationDeadlineError()), milliseconds);
+  try {
+    return await operation(signal);
+  } finally {
+    clearTimeout(timer);
+    controller.abort(new DOMException("Recommendation stage finished", "AbortError"));
+  }
+}
+
+function waitForSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => {
+      const reason: unknown = signal.reason;
+      reject(reason instanceof Error ? reason : new Error("Recommendation cancelled", { cause: reason }));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function isPartialResultError(error: unknown): boolean {
+  return error instanceof RecommendationDeadlineError || (error instanceof EatsError && [
+    "UPSTREAM_TIMEOUT", "UPSTREAM_UNAVAILABLE", "UPSTREAM_RATE_LIMITED", "UPSTREAM_BAD_RESPONSE",
+  ].includes(error.code));
 }
 
 function mergeSearchEvidence(places: Map<string, PlaceEvidence>, search: NormalizedSearch, query: string): void {
@@ -460,7 +592,7 @@ export function selectSameRestaurantResults(
   limit: number,
 ): {
   results: FoodResult[];
-  restaurantCoverage: {
+  restaurantCoverage?: {
     placeSlug: string;
     placeName: string;
     matchedGroups: number;
@@ -503,10 +635,15 @@ export function selectSameRestaurantResults(
       placeSlug,
       placeName: restaurantCandidates[0]?.placeName ?? placeSlug,
       selected: selected.map((entry) => entry.candidate),
+      alternatives: restaurantCandidates.filter((candidate) => groups.length === 0 || groups.some((group) =>
+        evaluateIntentGroup(group, candidate.normalized, candidateText(candidate)).intentCoverage > 0
+      )),
       matchedGroups: selected.length,
       fullGroups: selected.filter((entry) => entry.match.matchedIntent).length,
       coverageScore: selected.reduce((total, entry) => total + entry.match.intentCoverage, 0),
-      score: selected.reduce((total, entry) => total + entry.candidate.score, 0),
+      score: groups.length === 0
+        ? restaurantCandidates.slice(0, limit).reduce((total, candidate) => total + candidate.score, 0)
+        : selected.reduce((total, entry) => total + entry.candidate.score, 0),
     };
   }).sort((left, right) =>
     right.coverageScore - left.coverageScore ||
@@ -517,16 +654,22 @@ export function selectSameRestaurantResults(
   );
 
   const best = ranked[0];
-  if (!best || best.matchedGroups === 0) return undefined;
+  if (!best || (best.matchedGroups === 0 && groups.length > 0)) return undefined;
+  const selected = [...best.selected];
+  if (groups.length <= 1) {
+    for (const candidate of best.alternatives) {
+      if (!selected.includes(candidate)) selected.push(candidate);
+    }
+  }
   return {
-    results: best.selected.slice(0, limit),
-    restaurantCoverage: {
+    results: selected.slice(0, limit),
+    ...(groups.length > 0 ? { restaurantCoverage: {
       placeSlug: best.placeSlug,
       placeName: best.placeName,
       matchedGroups: best.matchedGroups,
       totalGroups: groups.length,
       coverage: round(best.coverageScore / groups.length),
-    },
+    } } : {}),
   };
 }
 

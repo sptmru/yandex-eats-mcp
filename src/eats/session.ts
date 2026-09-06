@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Cookie, CookieJar, type SerializedCookieJar } from "tough-cookie";
 import type { Logger } from "pino";
@@ -18,6 +18,7 @@ export class EatsSession {
   private cookieLoaded = false;
   private eatsSession: string | undefined;
   private sourceHash: string | undefined;
+  private cookieSaveQueue = Promise.resolve();
 
   constructor(
     private readonly config: AppConfig,
@@ -151,22 +152,30 @@ export class EatsSession {
   }
 
   private async persistCookieState(): Promise<void> {
-    if (!this.sourceHash) return;
-    const serialized = this.jar.serializeSync();
-    if (!serialized) return;
-    const state: CookieState = {
-      sourceHash: this.sourceHash,
-      jar: serialized,
-      ...(this.eatsSession ? { eatsSession: this.eatsSession } : {}),
-    };
-    await atomicWrite(join(this.config.stateDir, "cookies.json"), JSON.stringify(state));
+    const operation = this.cookieSaveQueue.then(async () => {
+      if (!this.sourceHash) return;
+      const serialized = this.jar.serializeSync();
+      if (!serialized) return;
+      const state: CookieState = {
+        sourceHash: this.sourceHash,
+        jar: serialized,
+        ...(this.eatsSession ? { eatsSession: this.eatsSession } : {}),
+      };
+      await atomicWrite(join(this.config.stateDir, "cookies.json"), JSON.stringify(state));
+    });
+    this.cookieSaveQueue = operation.then(() => undefined, () => undefined);
+    await operation;
   }
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
+  try {
+    await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
 function fileErrorCode(error: unknown): string {

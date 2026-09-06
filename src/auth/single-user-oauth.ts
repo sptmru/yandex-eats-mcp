@@ -1,8 +1,9 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Request, Response } from "express";
 import type { Logger } from "pino";
+import { z } from "zod";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
   AccessDeniedError,
@@ -16,10 +17,11 @@ import type {
   OAuthServerProvider,
 } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import type {
-  OAuthClientInformationFull,
-  OAuthTokenRevocationRequest,
-  OAuthTokens,
+import {
+  OAuthClientInformationFullSchema,
+  type OAuthClientInformationFull,
+  type OAuthTokenRevocationRequest,
+  type OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
@@ -39,6 +41,17 @@ type PersistedOAuthState = {
   clients: Record<string, OAuthClientInformationFull>;
   tokens: Record<string, StoredToken>;
 };
+
+const persistedOAuthStateSchema = z.object({
+  clients: z.record(z.string(), OAuthClientInformationFullSchema),
+  tokens: z.record(z.string(), z.object({
+    clientId: z.string(),
+    scopes: z.array(z.string()),
+    expiresAt: z.number().int(),
+    kind: z.enum(["access", "refresh"]),
+    resource: z.string(),
+  })),
+});
 
 type PendingAuthorization = {
   client: OAuthClientInformationFull;
@@ -77,8 +90,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           client_id: clientId,
           client_id_issued_at: runtimeInput.client_id_issued_at ?? Math.floor(Date.now() / 1000),
         };
-        this.state.clients[clientId] = client;
-        await this.persist();
+        await this.updateState((state) => { state.clients[clientId] = client; });
         this.logger.info({ clientId, clientName: client.client_name }, "Registered MCP OAuth client");
         return client;
       },
@@ -88,16 +100,12 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     try {
-      const parsed = JSON.parse(await readFile(this.statePath, "utf8")) as Partial<PersistedOAuthState>;
-      this.state = {
-        clients: parsed.clients && typeof parsed.clients === "object" ? parsed.clients : {},
-        tokens: parsed.tokens && typeof parsed.tokens === "object" ? parsed.tokens : {},
-      };
-    } catch {
+      this.state = persistedOAuthStateSchema.parse(JSON.parse(await readFile(this.statePath, "utf8")));
+    } catch (error) {
+      if (!isMissingFile(error)) throw new Error("OAuth state could not be loaded; the existing file was preserved.", { cause: error });
       this.state = { clients: {}, tokens: {} };
     }
-    this.pruneExpiredTokens();
-    await this.persist();
+    await this.updateState((state) => this.pruneExpiredTokens(state));
   }
 
   authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
@@ -258,12 +266,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const key = hashToken(authorizationCode);
-    const code = this.getCode(client, authorizationCode);
-    if (redirectUri && redirectUri !== code.params.redirectUri) {
-      throw new InvalidGrantError("Authorization code redirect URI mismatch");
-    }
-    if (resource) this.validateResource(resource);
-    this.codes.delete(key);
+    const tokens = await this.updateState((state) => {
+      const code = this.getCode(client, authorizationCode);
+      if (redirectUri && redirectUri !== code.params.redirectUri) {
+        throw new InvalidGrantError("Authorization code redirect URI mismatch");
+      }
+      if (resource) this.validateResource(resource);
+      return this.issueTokenPair(state, client.client_id, code.params.scopes ?? [SUPPORTED_SCOPE]);
+    }, () => { this.codes.delete(key); });
     this.logger.info(
       {
         clientId: client.client_id,
@@ -271,7 +281,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       },
       "Exchanged MCP OAuth authorization code",
     );
-    return this.issueTokenPair(client.client_id, code.params.scopes ?? [SUPPORTED_SCOPE]);
+    return tokens;
   }
 
   async exchangeRefreshToken(
@@ -281,26 +291,26 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     resource?: URL,
   ): Promise<OAuthTokens> {
     const key = hashToken(refreshToken);
-    const stored = this.state.tokens[key];
-    if (!stored || stored.kind !== "refresh" || stored.expiresAt < epochSeconds()) {
-      delete this.state.tokens[key];
-      throw new InvalidGrantError("Invalid or expired refresh token");
-    }
-    if (stored.clientId !== client.client_id) throw new InvalidGrantError("Refresh token client mismatch");
-    if (resource) this.validateResource(resource);
-    const requestedScopes = scopes?.length ? scopes : stored.scopes;
-    if (requestedScopes.some((scope) => !stored.scopes.includes(scope))) {
-      throw new InvalidScopeError("Refresh token cannot expand scopes");
-    }
-    delete this.state.tokens[key];
-    return this.issueTokenPair(client.client_id, requestedScopes);
+    return this.updateState((state) => {
+      const stored = state.tokens[key];
+      if (!stored || stored.kind !== "refresh" || stored.expiresAt <= epochSeconds()) {
+        throw new InvalidGrantError("Invalid or expired refresh token");
+      }
+      if (stored.clientId !== client.client_id) throw new InvalidGrantError("Refresh token client mismatch");
+      if (resource) this.validateResource(resource);
+      const requestedScopes = scopes?.length ? scopes : stored.scopes;
+      if (requestedScopes.some((scope) => !stored.scopes.includes(scope))) {
+        throw new InvalidScopeError("Refresh token cannot expand scopes");
+      }
+      delete state.tokens[key];
+      return this.issueTokenPair(state, client.client_id, requestedScopes);
+    });
   }
 
   verifyAccessToken(token: string): Promise<AuthInfo> {
     const key = hashToken(token);
     const stored = this.state.tokens[key];
-    if (!stored || stored.kind !== "access" || stored.expiresAt < epochSeconds()) {
-      delete this.state.tokens[key];
+    if (!stored || stored.kind !== "access" || stored.expiresAt <= epochSeconds()) {
       return Promise.reject(new AccessDeniedError("Invalid or expired access token"));
     }
     if (stored.resource !== this.resourceUrl.href) {
@@ -318,8 +328,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 
   async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
     const key = hashToken(request.token);
-    if (this.state.tokens[key]?.clientId === client.client_id) delete this.state.tokens[key];
-    await this.persist();
+    await this.updateState((state) => {
+      if (state.tokens[key]?.clientId === client.client_id) delete state.tokens[key];
+    });
   }
 
   private getCode(client: OAuthClientInformationFull, rawCode: string): AuthorizationCode {
@@ -335,24 +346,23 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return code;
   }
 
-  private async issueTokenPair(clientId: string, scopes: string[]): Promise<OAuthTokens> {
+  private issueTokenPair(state: PersistedOAuthState, clientId: string, scopes: string[]): OAuthTokens {
     const accessToken = secureToken();
     const refreshToken = secureToken();
-    this.state.tokens[hashToken(accessToken)] = {
+    state.tokens[hashToken(accessToken)] = {
       clientId,
       scopes,
       expiresAt: epochSeconds() + ACCESS_TOKEN_TTL_SECONDS,
       kind: "access",
       resource: this.resourceUrl.href,
     };
-    this.state.tokens[hashToken(refreshToken)] = {
+    state.tokens[hashToken(refreshToken)] = {
       clientId,
       scopes,
       expiresAt: epochSeconds() + REFRESH_TOKEN_TTL_SECONDS,
       kind: "refresh",
       resource: this.resourceUrl.href,
     };
-    await this.persist();
     return {
       access_token: accessToken,
       token_type: "Bearer",
@@ -368,10 +378,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
   }
 
-  private pruneExpiredTokens(): void {
+  private pruneExpiredTokens(state: PersistedOAuthState): void {
     const now = epochSeconds();
-    for (const [key, token] of Object.entries(this.state.tokens)) {
-      if (token.expiresAt < now) delete this.state.tokens[key];
+    for (const [key, token] of Object.entries(state.tokens)) {
+      if (token.expiresAt <= now) delete state.tokens[key];
     }
   }
 
@@ -381,13 +391,24 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     for (const [key, code] of this.codes) if (code.expiresAt < now) this.codes.delete(key);
   }
 
-  private persist(): Promise<void> {
-    this.saveQueue = this.saveQueue.then(async () => {
+  private updateState<T>(update: (state: PersistedOAuthState) => T, afterCommit?: () => void): Promise<T> {
+    const operation = this.saveQueue.then(async () => {
+      const next = structuredClone(this.state);
+      const result = update(next);
       const temporary = `${this.statePath}.${randomUUID()}.tmp`;
-      await writeFile(temporary, JSON.stringify(this.state), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, this.statePath);
+      try {
+        await writeFile(temporary, JSON.stringify(next), { encoding: "utf8", mode: 0o600 });
+        await rename(temporary, this.statePath);
+      } finally {
+        await rm(temporary, { force: true }).catch(() => undefined);
+      }
+      this.state = next;
+      afterCommit?.();
+      return result;
     });
-    return this.saveQueue;
+    // Keep the queue usable after a failed write while returning that failure to its caller.
+    this.saveQueue = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   private get statePath(): string {
@@ -413,6 +434,10 @@ export class StaticBearerVerifier {
 
 function secureToken(): string {
   return randomBytes(32).toString("base64url");
+}
+
+function isMissingFile(error: unknown): boolean {
+  return error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
 
 function hashToken(value: string): string {
