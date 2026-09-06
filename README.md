@@ -197,7 +197,12 @@ After any successful mutation, the MCP reloads and returns the server cart. Budg
 ```json
 {
   "query": "light lunch, fish / salad / seafood / soup, give me 10 varied options",
-  "categories": ["fish", "salad", "seafood", "soup"],
+  "cuisines": ["asian"],
+  "anyOf": [
+    { "categories": ["salad"] },
+    { "categories": ["soup"] },
+    { "proteins": ["fish", "seafood"] }
+  ],
   "prefer": ["grilled", "vegetables"],
   "avoid": ["deep fried", "creamy"],
   "maxPrice": 5000,
@@ -210,7 +215,9 @@ After any successful mutation, the MCP reloads and returns the server cart. Budg
 }
 ```
 
-Each result includes restaurant metadata, item ID/name/description/price/weight, an optional translated `searchName` from Yandex's search projection, normalized food attributes, `matchedTerms`, `intentCoverage`, `matchedIntent`, per-query `intentMatches`, a 0..1 score, and concise `scoreReasons`. Each intent match separates `requiredTerms`, `preferredTerms`, `lexicalTerms`, and `excludedTerms`: for example, `легкий салат без жареного` requires `salad`, prefers `light`, and rejects `fried`. `modifierTerms` remains as a backward-compatible alias for `preferredTerms`. Negated concepts never become positive modifiers, and a matching exclusion is a hard filter.
+Each result includes restaurant metadata, item ID/name/description/price/weight, an optional translated `searchName` from Yandex's search projection, normalized food attributes, `matchedTerms`, `intentCoverage`, `matchedIntent`, per-query `intentMatches`, a 0..1 score, and concise `scoreReasons`. The response also exposes `candidatePlaces`, `shortlistedPlaces`, `menusLoaded`, and `shortlistReasons`; every shortlisted restaurant is attributed to the search intent that admitted it or to `exploration`. `vegetarian` is tri-state: `true` means positive evidence, `false` means a recognized animal ingredient, and `null` means unknown. Each intent match separates `requiredTerms`, `preferredTerms`, `lexicalTerms`, and `excludedTerms`: for example, `легкий салат без жареного` requires `salad`, prefers `light`, and rejects `fried`. `modifierTerms` remains as a backward-compatible alias for `preferredTerms`. Negated concepts never become positive modifiers, and a matching exclusion is a hard filter. When a semantic required concept is recognized, zero-coverage dishes are rejected before price, heaviness, and preference scoring.
+
+Use `cuisines`, `proteins`, and `cookingMethods` for dimension-specific constraints. Values within one top-level dimension are alternatives, while populated top-level dimensions are combined with AND. Use `anyOf` when alternatives cross dimensions: branches are ORed, and populated dimensions inside one branch are ANDed. Top-level constraints remain additional global AND filters. `categories` remains a backward-compatible semantic umbrella, so a normalized cuisine such as `asian` supplied there is routed to the matching normalized dimension instead of producing an empty result solely because it is not a dish category.
 
 Natural-language lists such as `рыба, морепродукты, салат или суп`, slash-separated lists, and `либо` are parsed as alternatives; shared modifiers such as `light` are applied to every branch. English and Russian person markers form separate intent groups. With `sameRestaurant=true`, restaurant selection maximizes the sum of the best coverage for every group before comparing item scores. Unknown but meaningful phrases such as `salsa verde` remain lexical preferences, so a required-concept-only match receives partial rather than full coverage.
 

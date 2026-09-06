@@ -62,10 +62,14 @@ describe("dish normalization", () => {
       query: "обед",
       categories: ["fish", "рыба", "salad", "салат"],
     })).toEqual(["рыба", "салат"]);
+    expect(expandSearchIntents({ query: "обед", categories: ["asian"] })).toContain("азиатская кухня");
   });
 
   it("does not classify tortellini as cake from a partial Russian word match", () => {
-    expect(normalizeDish({ name: "Тортеллини с куриным бульоном" }).categories).toEqual(["soup"]);
+    const normalized = normalizeDish({ name: "Тортеллини с куриным бульоном" });
+
+    expect(normalized.categories).toEqual(expect.arrayContaining(["soup", "meat"]));
+    expect(normalized.categories).not.toContain("dessert");
   });
 
   it.each([
@@ -128,6 +132,25 @@ describe("dish normalization", () => {
     });
   });
 
+  it("derives soup heaviness from ingredients and richness instead of the soup category alone", () => {
+    const clearVegetable = normalizeDish({ name: "Прозрачный овощной суп" });
+    const chickenNoodle = normalizeDish({ name: "Куриный суп с лапшой" });
+    const beefBean = normalizeDish({ name: "Острый суп из фасоли и говядины" });
+    const creamSeafood = normalizeDish({ name: "Сливочный суп с морепродуктами" });
+    const cheeseCream = normalizeDish({ name: "Сырный сливочный суп" });
+
+    expect(clearVegetable.heaviness).toBe(0.15);
+    expect(chickenNoodle.heaviness).toBe(0.25);
+    expect(beefBean.heaviness).toBe(0.5);
+    expect(creamSeafood.heaviness).toBe(0.58);
+    expect(cheeseCream.heaviness).toBe(0.7);
+    expect(evaluateIntent("легкий суп", beefBean, "Острый суп из фасоли и говядины")).toMatchObject({
+      matchedTerms: ["soup"],
+      intentCoverage: 0.7,
+      matchedIntent: false,
+    });
+  });
+
   it.each([
     ["жареное мясо", "Креветки во фритюре", "meat", "fried"],
     ["острый суп", "Острая курица", "soup", "spicy"],
@@ -170,10 +193,14 @@ describe("dish normalization", () => {
     });
   });
 
-  it("infers vegetarian only from positive ingredient or dietary evidence", () => {
-    expect(normalizeDish({ name: "Цезарь" }).vegetarian).toBe(false);
+  it("uses tri-state vegetarian inference and never misses Russian chicken adjectives", () => {
+    expect(normalizeDish({ name: "Цезарь" }).vegetarian).toBeNull();
     expect(normalizeDish({ name: "Поке с овощами" }).vegetarian).toBe(true);
     expect(normalizeDish({ name: "Поке с овощами и курицей" }).vegetarian).toBe(false);
+    const chickenSalad = normalizeDish({ name: "Салат с куриной грудкой и свежими овощами" });
+    expect(chickenSalad.categories).toEqual(expect.arrayContaining(["salad", "meat"]));
+    expect(chickenSalad.proteins).toContain("chicken");
+    expect(chickenSalad.vegetarian).toBe(false);
     expect(normalizeDish({ name: "Вегетарианский салат" }).vegetarian).toBe(true);
   });
 
@@ -241,6 +268,13 @@ describe("dish normalization", () => {
       normalized: friedSalad,
       intentMatches: [excludedMatch],
     }), { query }, [])).toBeUndefined();
+  });
+
+  it("starts a new negative clause at repeated conjunction plus negation", () => {
+    const parsed = parseRecommendationIntentGroups("без фастфуда и без тяжелого жареного");
+
+    expect(parsed.excludedTerms).toEqual(["fast_food", "fried", "heavy"]);
+    expect(parsed.excludedTerms).not.toContain("фастфуда без тяжелого");
   });
 
   it("parses English two-person alternatives and global negative constraints", () => {
@@ -320,6 +354,24 @@ describe("dish normalization", () => {
       intentCoverage: 1,
       matchedIntent: true,
     });
+  });
+
+  it("keeps orchestration language out of lexical food terms", () => {
+    const parsed = parseRecommendationIntentGroups(
+      "можно легкий суп, салат, рыбу или морепродукты; хочется разнообразия по ресторанам и типам блюд",
+    );
+
+    expect(parsed.groups[0]?.alternatives).toEqual([
+      ["soup", "light"],
+      ["salad", "light"],
+      ["fish", "light"],
+      ["seafood", "light"],
+    ]);
+    expect(parsed.groups[0]?.alternatives.flat()).not.toEqual(expect.arrayContaining([
+      "можно",
+      "хочется разнообразия ресторанам",
+      "типам блюд",
+    ]));
   });
 
   it.each([
@@ -432,6 +484,78 @@ describe("recommendation scoring and diversification", () => {
     expect(scoreCandidate(candidate, { query: "легкое рыбное блюдо", maxHeaviness: 0.65 }, [])).toBeUndefined();
   });
 
+  it("rejects zero-coverage candidates when the request contains a semantic intent", () => {
+    const normalized = normalizeDish({ name: "Борщ с мясом" });
+    const intentMatch = evaluateIntent("азиатское с курицей", normalized, "Борщ с мясом");
+    const candidate = makeCandidate({
+      name: "Борщ с мясом",
+      price: 1900,
+      normalized,
+      intentCoverage: intentMatch.intentCoverage,
+      matchedIntent: intentMatch.matchedIntent,
+      intentMatches: [intentMatch],
+      matchedTerms: intentMatch.matchedTerms,
+      matchedIntents: [],
+    });
+
+    expect(intentMatch.intentCoverage).toBe(0);
+    expect(scoreCandidate(candidate, {
+      query: "что-нибудь азиатское с курицей, не острое, не жареное, до 3500 драм",
+      maxPrice: 3500,
+    }, [])).toBeUndefined();
+  });
+
+  it("supports explicit taxonomy dimensions and keeps categories as a semantic compatibility filter", () => {
+    const candidate = makeCandidate({
+      name: "Teriyaki grilled chicken bowl",
+      normalized: normalizeDish({ name: "Teriyaki grilled chicken bowl" }),
+    });
+
+    expect(scoreCandidate(candidate, { query: "lunch", categories: ["asian"] }, [])).toBeDefined();
+    expect(scoreCandidate(candidate, {
+      query: "lunch",
+      cuisines: ["asian"],
+      proteins: ["chicken"],
+      cookingMethods: ["grilled"],
+    }, [])).toBeDefined();
+    expect(scoreCandidate(candidate, { query: "lunch", cuisines: ["italian"] }, [])).toBeUndefined();
+  });
+
+  it("supports explicit OR branches without changing legacy cross-dimension AND semantics", () => {
+    const salad = makeCandidate({
+      name: "Овощной салат",
+      normalized: normalizeDish({ name: "Овощной салат" }),
+    });
+    const salmon = makeCandidate({
+      name: "Лосось на гриле",
+      normalized: normalizeDish({ name: "Лосось на гриле" }),
+    });
+    const beef = makeCandidate({
+      name: "Говяжий стейк",
+      normalized: normalizeDish({ name: "Говяжий стейк" }),
+    });
+    const anyOf = [
+      { categories: ["salad"] },
+      { categories: ["soup"] },
+      { proteins: ["fish", "seafood"] },
+    ];
+
+    expect(scoreCandidate(salad, { query: "lunch", anyOf }, [])).toBeDefined();
+    expect(scoreCandidate(salmon, { query: "lunch", anyOf }, [])).toBeDefined();
+    expect(scoreCandidate(beef, { query: "lunch", anyOf }, [])).toBeUndefined();
+    expect(scoreCandidate(salad, {
+      query: "lunch",
+      categories: ["salad", "soup"],
+      proteins: ["fish", "seafood"],
+    }, [])).toBeUndefined();
+    expect(expandSearchIntents({ query: "обед", anyOf })).toEqual(expect.arrayContaining([
+      "салат",
+      "суп",
+      "рыба",
+      "морепродукты",
+    ]));
+  });
+
   it("honors category and restaurant quotas while retaining strong results", () => {
     const results = [
       makeResult("r1", "fish-1", "fish", 0.99),
@@ -507,6 +631,66 @@ describe("preference persistence", () => {
 });
 
 describe("recommendation orchestration", () => {
+  it("reports the balanced shortlist separately from the menus it loads", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "recommendation-shortlist-"));
+    temporaryDirectories.push(directory);
+    const places = Array.from({ length: 5 }, (_, index) => ({
+      placeSlug: `soup-${index + 1}`,
+      name: `Soup ${index + 1}`,
+      business: "restaurant",
+      available: true,
+      rating: "4.7",
+      promos: [],
+      items: [{
+        itemId: `item-${index + 1}`,
+        name: "Овощной суп",
+        price: 1500 + index * 100,
+        currency: "AMD",
+        adult: false,
+        hasRequiredOptions: false,
+      }],
+    }));
+    const search = vi.fn().mockResolvedValue({ query: "суп", currency: "AMD", places });
+    const getMenu = vi.fn(({ placeSlug }: { placeSlug: string }) => {
+      const index = Number.parseInt(placeSlug.split("-")[1] ?? "1", 10);
+      return Promise.resolve({
+        placeSlug,
+        currency: "AMD",
+        categories: [{
+          categoryId: "soups",
+          name: "Супы",
+          available: true,
+          categories: [],
+          items: [{
+            itemId: `item-${index}`,
+            name: "Овощной суп",
+            price: 1500 + (index - 1) * 100,
+            currency: "AMD",
+            available: true,
+            adult: false,
+            optionGroups: [],
+          }],
+        }],
+      });
+    });
+    const service = new RecommendationService(
+      { search, getMenu } as unknown as YandexEatsClient,
+      new FoodPreferenceStore(directory, createLogger("silent")),
+      createLogger("silent"),
+      { maxIntents: 6, maxMenus: 2, maxPagesPerQuery: 1, menuConcurrency: 2, menuCacheTtlMs: 60_000 },
+    );
+
+    const result = await service.searchItems({ queries: ["суп"], maxPlaces: 2, maxItems: 10 });
+
+    expect(result).toMatchObject({
+      candidatePlaces: 5,
+      shortlistedPlaces: 4,
+      shortlistReasons: { "суп": 4 },
+      menusLoaded: 2,
+    });
+    expect(getMenu).toHaveBeenCalledTimes(2);
+  });
+
   it("does not return a light non-soup for the compound search intent light soup", async () => {
     const directory = await mkdtemp(join(tmpdir(), "required-search-intent-"));
     temporaryDirectories.push(directory);
@@ -639,6 +823,12 @@ describe("recommendation orchestration", () => {
         { intent: "fish", matchedTerms: ["fish"], intentCoverage: 1, matchedIntent: true },
         { intent: "seafood", matchedTerms: [], intentCoverage: 0, matchedIntent: false },
       ],
+    });
+    expect(result).toMatchObject({
+      candidatePlaces: 2,
+      shortlistedPlaces: 2,
+      shortlistReasons: { fish: 1, exploration: 1 },
+      menusLoaded: 2,
     });
   });
 

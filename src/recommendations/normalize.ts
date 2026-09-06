@@ -15,7 +15,7 @@ const CATEGORY_RULES: Rule[] = [
   rule("salad", "salad", "caesar", "салат", "цезар"),
   rule("fish", "fish", "salmon", "trout", "tuna", "cod", "seabass", "дорадо", "рыб", "лосос", "семг", "сёмг", "форел", "тунц", "треск"),
   rule("seafood", "seafood", "shrimp", "prawn", "mussel", "squid", "octopus", "crab", "морепродукт", "кревет", "мид", "кальмар", "осьминог", "краб"),
-  rule("meat", "meat", "beef", "veal", "pork", "lamb", "mutton", "chicken", "turkey", "мяс", "говядин", "телят", "свинин", "баранин", "ягнен", "куриц", "цыплен", "индейк"),
+  rule("meat", "meat", "beef", "veal", "pork", "lamb", "mutton", "chicken", "turkey", "мяс", "говядин", "телят", "свинин", "баранин", "ягнен", "куриц", "курин", "цыплен", "индейк", "միս", "հավ"),
   rule("poke", "poke", "поке"),
   rule("bowl", "bowl", "боул"),
   rule("main", "main course", "steak", "стейк", "горячее", "основное блюдо"),
@@ -37,6 +37,7 @@ const CATEGORY_RULES: Rule[] = [
   rule("breakfast", "breakfast", "omelet", "omelette", "завтрак", "омлет", "сырник"),
   rule("dessert", "dessert", "cake", "brownie", "cheesecake", "десерт", "тортик", "брауни", "чизкейк"),
   rule("snack", "snack", "starter", "appetizer", "закуск", "снэк"),
+  rule("fast_food", "fast food", "fast-food", "фастфуд", "фаст фуд"),
 ];
 
 const PROTEIN_RULES: Rule[] = [
@@ -48,7 +49,7 @@ const PROTEIN_RULES: Rule[] = [
   rule("crab", "crab", "краб"),
   rule("mussels", "mussel", "мид"),
   rule("squid", "squid", "calamari", "кальмар"),
-  rule("chicken", "chicken", "turkey", "куриц", "цыплен", "индейк"),
+  rule("chicken", "chicken", "turkey", "куриц", "курин", "цыплен", "индейк", "հավ"),
   rule("beef", "beef", "veal", "говядин", "телят"),
   rule("pork", "pork", "bacon", "свинин", "бекон"),
   rule("lamb", "lamb", "mutton", "баранин", "ягнен"),
@@ -97,7 +98,7 @@ const CUISINE_RULES: Rule[] = [
   rule("italian", "italian", "pasta", "pizza", "итальян", "паста", "пицц"),
   rule("georgian", "georgian", "khinkali", "khachapuri", "грузин", "хинкал", "хачапур"),
   rule("armenian", "armenian", "lavash", "khorovats", "армян", "лаваш", "хоровац"),
-  rule("asian", "asian", "thai", "vietnamese", "азиат", "тайск", "вьетнам", "том ям", "поке"),
+  rule("asian", "asian", "thai", "vietnamese", "teriyaki", "wok", "pad thai", "sushi", "ramen", "азиат", "тайск", "вьетнам", "терияки", "вок", "суши", "рамен", "том ям", "поке"),
   rule("mediterranean", "mediterranean", "greek", "средиземномор", "греческ"),
   rule("mexican", "mexican", "taco", "burrito", "мексикан", "тако", "буррито"),
   rule("middle eastern", "middle eastern", "hummus", "falafel", "ближневост", "хумус", "фалафел"),
@@ -126,8 +127,18 @@ const VEGETARIAN_INGREDIENTS = patterns(
   "տոֆու",
   "ոսպ",
 );
+const ANIMAL_INGREDIENTS = patterns(
+  "meat", "beef", "veal", "pork", "lamb", "mutton", "chicken", "turkey", "bacon", "ham", "sausage",
+  "fish", "salmon", "trout", "tuna", "cod", "seabass", "shrimp", "prawn", "mussel", "squid", "octopus", "crab",
+  "мяс", "говядин", "телят", "свинин", "баранин", "ягнен", "куриц", "курин", "цыплен", "индейк",
+  "бекон", "ветчин", "колбас", "рыб", "лосос", "семг", "сёмг", "форел", "тунц", "треск",
+  "кревет", "мид", "кальмар", "осьминог", "краб",
+  "միս", "հավ", "տավար", "խոզ", "գառ", "ձուկ", "սաղմոն", "ծովախեցգետին",
+);
 const HEAVY = patterns("double", "loaded", "cheesy", "bacon", "butter", "cream", "майонез", "бекон", "сливоч", "сырный", "двойной");
 const LIGHT = patterns("light", "fresh", "low calorie", "лёгк", "легк", "свеж", "диетическ");
+const RICH_CREAM = patterns("cream", "creamy", "butter", "mayonnaise", "mayo", "сливоч", "масло", "майонез");
+const CHEESE = patterns("cheese", "cheesy", "сыр", "пармезан", "чеддер", "моцарелл");
 
 // Compound dishes carry characteristics that are often absent from their individual tokens.
 const COMPOUND_RULES: CompoundRule[] = [
@@ -175,23 +186,28 @@ export function normalizeDish(input: {
   const fried = cookingMethods.includes("fried");
   const creamy = matchesAny(text, CREAMY) || compounds.some((entry) => entry.creamy);
   const spicy = matchesAny(text, SPICY);
-  const hasAnimalProtein = proteins.some((protein) => !["tofu", "legumes"].includes(protein)) ||
+  const hasAnimalIngredient = matchesAny(text, ANIMAL_INGREDIENTS) ||
+    proteins.some((protein) => !["tofu", "legumes", "egg"].includes(protein)) ||
     categories.some((category) => ["fish", "seafood", "meat"].includes(category));
-  const hasVegetarianEvidence = matchesAny(text, VEGETARIAN) ||
-    matchesAny(text, VEGETARIAN_INGREDIENTS) ||
+  const explicitVegetarianSignal = matchesAny(text, VEGETARIAN);
+  const hasPlantEvidence = matchesAny(text, VEGETARIAN_INGREDIENTS) ||
     proteins.some((protein) => ["tofu", "legumes"].includes(protein));
-  const vegetarian = !hasAnimalProtein && hasVegetarianEvidence;
+  const categoryAllowsVegetarianInference = categories.some((category) =>
+    ["salad", "poke", "bowl", "soup"].includes(category)
+  );
+  const vegetarian = explicitVegetarianSignal
+    ? true
+    : hasAnimalIngredient ? false : (hasPlantEvidence && categoryAllowsVegetarianInference) ? true : null;
 
-  let heaviness = 0.45;
-  if (categories.includes("salad")) heaviness -= 0.2;
-  if (categories.includes("soup")) heaviness -= 0.12;
-  if (categories.includes("poke") || categories.includes("bowl")) heaviness -= 0.08;
+  let heaviness = baseHeaviness(categories);
+  heaviness += ingredientHeaviness(categories, proteins);
   if (cookingMethods.includes("grilled") || cookingMethods.includes("steamed") || cookingMethods.includes("boiled")) heaviness -= 0.1;
   if (fried) heaviness += 0.28;
   if (ingredientCookingMethods.includes("fried")) heaviness += 0.05;
   if (creamy) heaviness += 0.18;
-  if (categories.includes("pizza") || categories.includes("sandwich") || categories.includes("pasta")) heaviness += 0.18;
   if (matchesAny(text, HEAVY)) heaviness += 0.12;
+  if (matchesAny(text, RICH_CREAM)) heaviness += 0.08;
+  if (matchesAny(text, CHEESE)) heaviness += 0.17;
   if (matchesAny(text, LIGHT)) heaviness -= 0.12;
   heaviness += primaryCompounds.reduce((total, entry) => total + entry.heaviness, 0);
   heaviness += ingredientCompounds.reduce((total, entry) => total + Math.min(entry.heaviness, 0.05), 0);
@@ -221,17 +237,18 @@ export function normalizeText(value: string): string {
 }
 
 export function tokenize(value: string): string[] {
-  return unique(normalizeText(value).split(" ").filter((token) => token.length >= 3 && !STOP_WORDS.has(token)));
+  return unique(normalizeText(value).split(" ").filter((token) => token.length >= 3 && !isStopWord(token)));
 }
 
 export function termMatchesDish(term: string, dish: NormalizedDish, text: string): boolean {
   const normalized = normalizeText(term);
   if (!normalized) return false;
   if (normalized === "light") return dish.heaviness < 0.45;
+  if (normalized === "heavy") return dish.heaviness >= 0.55;
   if (normalized === "filling") return dish.heaviness >= 0.55;
   if (normalized === "creamy") return dish.creamy;
   if (normalized === "spicy") return dish.spicy;
-  if (normalized === "vegetarian" || normalized === "vegan") return dish.vegetarian;
+  if (normalized === "vegetarian" || normalized === "vegan") return dish.vegetarian === true;
   const canonical = canonicalValues(normalized);
   const specificProteins = canonical.filter((value) => PROTEIN_RULES.some((entry) => entry.value === value));
   const semanticValues = specificProteins.length > 0 ? specificProteins : canonical;
@@ -295,6 +312,37 @@ function weightAdjustment(weight?: string): number {
   return 0;
 }
 
+function baseHeaviness(categories: string[]): number {
+  if (categories.includes("soup")) return 0.15;
+  if (categories.includes("salad")) return 0.2;
+  if (categories.includes("poke") || categories.includes("bowl")) return 0.34;
+  if (categories.includes("pasta")) return 0.56;
+  if (categories.includes("pizza") || categories.includes("sandwich")) return 0.58;
+  if (categories.includes("dessert")) return 0.58;
+  if (categories.includes("breakfast")) return 0.4;
+  if (categories.includes("snack")) return 0.45;
+  if (categories.includes("main")) return 0.42;
+  return 0.45;
+}
+
+function ingredientHeaviness(categories: string[], proteins: string[]): number {
+  let penalty = 0;
+  const hasDenseMeat = proteins.some((protein) => ["beef", "pork", "lamb"].includes(protein));
+  if (hasDenseMeat) penalty += 0.18;
+  else if (proteins.includes("chicken")) penalty += 0.06;
+  else if (proteins.some((protein) => ["salmon", "trout", "tuna", "white fish"].includes(protein))) penalty += 0.08;
+  else if (proteins.some((protein) => ["shrimp", "crab", "mussels", "squid"].includes(protein))) penalty += 0.05;
+  else if (categories.includes("meat")) penalty += 0.14;
+  else if (categories.includes("fish")) penalty += 0.08;
+  else if (categories.includes("seafood")) penalty += 0.05;
+
+  if (proteins.includes("legumes")) penalty += 0.12;
+  if (proteins.includes("egg")) penalty += 0.04;
+  if (hasDenseMeat && proteins.includes("legumes")) penalty += 0.05;
+  if ((categories.includes("soup") || categories.includes("bowl")) && categories.includes("pasta")) penalty += 0.04;
+  return penalty;
+}
+
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
 }
@@ -312,7 +360,26 @@ function escapeRegExp(value: string): string {
 }
 
 const STOP_WORDS = new Set([
-  "and", "the", "with", "for", "from", "give", "want", "wants", "something", "anything", "please",
-  "lunch", "dinner", "food", "dish", "one", "other", "people", "person", "ideally", "both", "same", "restaurant",
-  "или", "либо", "для", "мне", "хочу", "дай", "что", "нибудь", "пожалуйста", "обед", "ужин", "блюдо",
+  "and", "the", "with", "for", "from", "give", "find", "suggest", "recommend", "want", "wants", "something", "anything", "please",
+  "lunch", "dinner", "food", "dish", "dishes", "option", "options", "one", "other", "people", "person", "ideally", "both", "same",
+  "restaurant", "restaurants", "type", "types", "varied", "diverse", "different", "variety",
+  "или", "либо", "для", "мне", "дай", "что", "чего", "нибудь", "пожалуйста", "обед", "ужин",
 ]);
+
+const STOP_WORD_PATTERNS = [
+  /^можно$/u,
+  /^хоч(?:у|ешь|ет|ем|ете|ется)$/u,
+  /^давай(?:те)?$/u,
+  /^накида(?:й|йте)$/u,
+  /^подбер(?:и|ите)$/u,
+  /^вариант\p{L}*$/u,
+  /^блюд\p{L}*$/u,
+  /^разн\p{L}*$/u,
+  /^разнообраз\p{L}*$/u,
+  /^ресторан\p{L}*$/u,
+  /^тип(?:ы|а|ов|ам|ами|ах)?$/u,
+];
+
+function isStopWord(token: string): boolean {
+  return STOP_WORDS.has(token) || STOP_WORD_PATTERNS.some((pattern) => pattern.test(token));
+}

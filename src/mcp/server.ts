@@ -43,6 +43,17 @@ const optionInputSchema = z.object({
     .min(1),
 });
 
+const recommendationFilterGroupInputSchema = z.object({
+  categories: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  cuisines: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  proteins: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  cookingMethods: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+}).refine(
+  (group) => [group.categories, group.cuisines, group.proteins, group.cookingMethods]
+    .some((terms) => terms !== undefined && terms.length > 0),
+  { message: "Each anyOf branch must contain at least one taxonomy constraint." },
+);
+
 export function createYandexEatsMcpServer(
   client: YandexEatsClient,
   config: AppConfig,
@@ -166,10 +177,24 @@ export function createYandexEatsMcpServer(
     {
       title: "Recommend Yandex Eats dishes",
       description:
-        "Recommend current menu items for a natural-language request using deterministic multilingual normalization, constraint coverage, preference/price/heaviness scoring, and intent-group restaurant selection.",
+        "Recommend current menu items for a natural-language request using deterministic multilingual normalization, semantic admission filtering, explicit taxonomy constraints, preference/price/heaviness scoring, and intent-group restaurant selection.",
       inputSchema: {
         query: z.string().trim().min(1).max(500),
-        categories: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+        categories: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe(
+          "Dish categories such as salad, soup, or poke. Also accepts cuisine, protein, and cooking-method concepts as a backward-compatible semantic umbrella.",
+        ),
+        cuisines: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe(
+          "Required cuisine alternatives such as asian, italian, or armenian.",
+        ),
+        proteins: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe(
+          "Required protein alternatives such as chicken, salmon, or shrimp.",
+        ),
+        cookingMethods: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe(
+          "Required primary cooking-method alternatives such as grilled, fried, or steamed.",
+        ),
+        anyOf: z.array(recommendationFilterGroupInputSchema).min(1).max(20).optional().describe(
+          "OR branches for taxonomy filters. A dish must match every populated dimension inside one branch. Top-level taxonomy fields remain additional AND constraints.",
+        ),
         prefer: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
         avoid: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
         maxPrice: z.number().nonnegative().optional(),

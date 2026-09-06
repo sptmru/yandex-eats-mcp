@@ -9,7 +9,7 @@ export const normalizedDishSchema = z.object({
   spicy: z.boolean(),
   fried: z.boolean(),
   creamy: z.boolean(),
-  vegetarian: z.boolean(),
+  vegetarian: z.boolean().nullable(),
   heaviness: z.number().min(0).max(1),
 });
 
@@ -65,6 +65,8 @@ export const foodResultSchema = z.object({
 export const foodSearchResultSchema = z.object({
   queries: z.array(z.string()),
   candidatePlaces: z.number().int().nonnegative(),
+  shortlistedPlaces: z.number().int().nonnegative(),
+  shortlistReasons: z.record(z.string(), z.number().int().nonnegative()),
   menusLoaded: z.number().int().nonnegative(),
   results: z.array(foodResultSchema),
   warnings: z.array(z.string()),
@@ -84,6 +86,8 @@ export const recommendationResultSchema = z.object({
     coverage: z.number().min(0).max(1),
   }).optional(),
   candidatePlaces: z.number().int().nonnegative(),
+  shortlistedPlaces: z.number().int().nonnegative(),
+  shortlistReasons: z.record(z.string(), z.number().int().nonnegative()),
   menusLoaded: z.number().int().nonnegative(),
   results: z.array(foodResultSchema),
   warnings: z.array(z.string()),
@@ -117,9 +121,20 @@ export type DishCandidate = Omit<FoodResult, "score" | "scoreReasons"> & {
   relevance: number;
 };
 
+export type RecommendationFilterGroup = {
+  categories?: string[] | undefined;
+  cuisines?: string[] | undefined;
+  proteins?: string[] | undefined;
+  cookingMethods?: string[] | undefined;
+};
+
 export type RecommendFoodInput = {
   query: string;
   categories?: string[] | undefined;
+  cuisines?: string[] | undefined;
+  proteins?: string[] | undefined;
+  cookingMethods?: string[] | undefined;
+  anyOf?: RecommendationFilterGroup[] | undefined;
   prefer?: string[] | undefined;
   avoid?: string[] | undefined;
   maxPrice?: number | undefined;

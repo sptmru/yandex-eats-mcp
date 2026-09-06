@@ -78,6 +78,8 @@ export class RecommendationService {
     return {
       queries,
       candidatePlaces: gathered.candidatePlaces,
+      shortlistedPlaces: gathered.shortlistedPlaces,
+      shortlistReasons: gathered.shortlistReasons,
       menusLoaded: gathered.menusLoaded,
       results,
       warnings: gathered.warnings,
@@ -90,6 +92,10 @@ export class RecommendationService {
     const searchIntents = expandSearchIntents({
       query: input.query,
       ...(input.categories ? { categories: input.categories } : {}),
+      ...(input.cuisines ? { cuisines: input.cuisines } : {}),
+      ...(input.proteins ? { proteins: input.proteins } : {}),
+      ...(input.cookingMethods ? { cookingMethods: input.cookingMethods } : {}),
+      ...(input.anyOf ? { anyOf: input.anyOf } : {}),
       ...(input.prefer ? { prefer: input.prefer } : {}),
       maxIntents: this.options.maxIntents,
     });
@@ -124,6 +130,8 @@ export class RecommendationService {
       sameRestaurant,
       ...(grouped?.restaurantCoverage ? { restaurantCoverage: grouped.restaurantCoverage } : {}),
       candidatePlaces: gathered.candidatePlaces,
+      shortlistedPlaces: gathered.shortlistedPlaces,
+      shortlistReasons: gathered.shortlistReasons,
       menusLoaded: gathered.menusLoaded,
       results,
       warnings: gathered.warnings,
@@ -142,7 +150,14 @@ export class RecommendationService {
     queries: string[];
     maxPlaces: number;
     maxPagesPerQuery: number;
-  }): Promise<{ candidates: DishCandidate[]; candidatePlaces: number; menusLoaded: number; warnings: string[] }> {
+  }): Promise<{
+    candidates: DishCandidate[];
+    candidatePlaces: number;
+    shortlistedPlaces: number;
+    shortlistReasons: Record<string, number>;
+    menusLoaded: number;
+    warnings: string[];
+  }> {
     const places = new Map<string, PlaceEvidence>();
     for (const query of input.queries) {
       let cursor: string | undefined;
@@ -159,7 +174,12 @@ export class RecommendationService {
       }
     }
 
-    const rankedPlaces = selectDiversePlaces([...places.values()], input.queries, input.maxPlaces);
+    const shortlist = selectDiversePlaces(
+      [...places.values()],
+      input.queries,
+      Math.min(places.size, input.maxPlaces * 2),
+    );
+    const rankedPlaces = shortlist.places.slice(0, input.maxPlaces);
     const warnings: string[] = [];
     let menusLoaded = 0;
     const menuResults = await mapLimit(rankedPlaces, this.options.menuConcurrency, async (place) => {
@@ -244,6 +264,8 @@ export class RecommendationService {
     return {
       candidates: deduplicateCandidates(candidates),
       candidatePlaces: places.size,
+      shortlistedPlaces: shortlist.places.length,
+      shortlistReasons: shortlist.reasons,
       menusLoaded,
       warnings,
     };
@@ -282,10 +304,21 @@ function placeEvidenceScore(place: PlaceEvidence): number {
   return itemEvidence + place.matchedQueries.size + ratingSignal(parseRating(place.rating));
 }
 
-function selectDiversePlaces(places: PlaceEvidence[], queries: string[], limit: number): PlaceEvidence[] {
+function selectDiversePlaces(
+  places: PlaceEvidence[],
+  queries: string[],
+  limit: number,
+): { places: PlaceEvidence[]; reasons: Record<string, number> } {
   const ranked = [...places].sort((left, right) => placeEvidenceScore(right) - placeEvidenceScore(left));
   const selected: PlaceEvidence[] = [];
   const selectedSlugs = new Set<string>();
+  const reasons: Record<string, number> = {};
+
+  const select = (place: PlaceEvidence, reason: string): void => {
+    selected.push(place);
+    selectedSlugs.add(place.placeSlug);
+    reasons[reason] = (reasons[reason] ?? 0) + 1;
+  };
 
   while (selected.length < limit) {
     let added = false;
@@ -296,8 +329,7 @@ function selectDiversePlaces(places: PlaceEvidence[], queries: string[], limit: 
           [...place.searchItems.values()].some((item) => item.queries.has(query)),
       );
       if (!candidate) continue;
-      selected.push(candidate);
-      selectedSlugs.add(candidate.placeSlug);
+      select(candidate, query);
       added = true;
       if (selected.length >= limit) break;
     }
@@ -307,10 +339,9 @@ function selectDiversePlaces(places: PlaceEvidence[], queries: string[], limit: 
   for (const place of ranked) {
     if (selected.length >= limit) break;
     if (selectedSlugs.has(place.placeSlug)) continue;
-    selected.push(place);
-    selectedSlugs.add(place.placeSlug);
+    select(place, "exploration");
   }
-  return selected;
+  return { places: selected, reasons };
 }
 
 function createSearchItemEvidence(

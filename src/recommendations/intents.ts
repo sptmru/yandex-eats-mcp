@@ -1,8 +1,10 @@
 import { canonicalValues, normalizeText, tokenize } from "./normalize.js";
-import type { IntentMatch, NormalizedDish, RecommendationIntentGroup } from "./types.js";
+import type { IntentMatch, NormalizedDish, RecommendationFilterGroup, RecommendationIntentGroup } from "./types.js";
 
 const LIGHT = /(light|healthy|not too heavy|л[её]гк\p{L}*|не тяжел\p{L}*|полезн\p{L}*)/iu;
 const FILLING = /(filling|substantial|satisfying|сытн\p{L}*|насыт\p{L}*)/iu;
+const HEAVY = /(heavy|тяжел\p{L}*)/iu;
+const NOT_TOO_HEAVY = /(not too heavy|не тяжел\p{L}*)/iu;
 const CREAMY = /(cream|creamy|mayonnaise|mayo|сливоч\p{L}*|майонез\p{L}*)/iu;
 const VARIED = /(varied|diverse|different|variety|разн\p{L}*|разнообраз\p{L}*)/iu;
 const CYRILLIC = /\p{Script=Cyrillic}/u;
@@ -19,6 +21,7 @@ const SEARCH_TERMS: Record<string, { en: string; ru: string }> = {
   chicken: { en: "chicken bowl", ru: "боул с курицей" },
   meat: { en: "meat", ru: "мясо" },
   fried: { en: "fried", ru: "жареное" },
+  asian: { en: "Asian food", ru: "азиатская кухня" },
   beef: { en: "beef", ru: "говядина" },
   pork: { en: "pork", ru: "свинина" },
   lamb: { en: "lamb", ru: "баранина" },
@@ -29,6 +32,7 @@ const SEAFOOD_PROTEINS = new Set(["shrimp", "crab", "mussels", "squid"]);
 const MEAT_PROTEINS = new Set(["chicken", "beef", "pork", "lamb"]);
 const MODIFIER_TERMS = new Set([
   "light",
+  "heavy",
   "filling",
   "spicy",
   "vegetarian",
@@ -46,13 +50,29 @@ const MODIFIER_TERMS = new Set([
 export function expandSearchIntents(input: {
   query: string;
   categories?: string[];
+  cuisines?: string[];
+  proteins?: string[];
+  cookingMethods?: string[];
+  anyOf?: RecommendationFilterGroup[];
   prefer?: string[];
   maxIntents?: number;
 }): string[] {
   const query = input.query.trim();
   const { affirmativeText, excludedTerms } = parseNegation(query);
   const language = CYRILLIC.test(query) ? "ru" : "en";
-  const explicit = [...(input.categories ?? []), ...(input.prefer ?? [])];
+  const explicit = [
+    ...(input.categories ?? []),
+    ...(input.cuisines ?? []),
+    ...(input.proteins ?? []),
+    ...(input.cookingMethods ?? []),
+    ...(input.anyOf ?? []).flatMap((group) => [
+      ...(group.categories ?? []),
+      ...(group.cuisines ?? []),
+      ...(group.proteins ?? []),
+      ...(group.cookingMethods ?? []),
+    ]),
+    ...(input.prefer ?? []),
+  ];
   const excluded = new Set(excludedTerms);
   const canonical = new Set(
     [...canonicalValues(affirmativeText), ...explicit.flatMap(canonicalValues)].filter((term) => !excluded.has(term)),
@@ -145,9 +165,11 @@ export function parseRecommendationIntentGroups(query: string): {
     const { alternatives, sharedQualifierTerms } = splitAlternativePhrases(affirmativeText);
     const commonTerms = extractCommonModifierTerms(context);
     const parsedAlternatives = alternatives.map((alternative) => {
-      const terms = extractIntentTerms(alternative).filter((term) => !commonTerms.includes(term));
-      const fallback = terms.length === 0 ? tokenize(alternative).slice(0, 3) : terms;
-      return unique([...fallback, ...sharedQualifierTerms, ...commonTerms]);
+      const extractedTerms = extractIntentTerms(alternative);
+      const terms = extractedTerms.filter((term) => !commonTerms.includes(term));
+      const localTerms = extractedTerms.length === 0 ? tokenize(alternative).slice(0, 3) : terms;
+      if (localTerms.length === 0) return [];
+      return unique([...localTerms, ...sharedQualifierTerms, ...commonTerms]);
     }).filter((terms) => terms.length > 0);
     return {
       id: `group-${index + 1}`,
@@ -219,9 +241,10 @@ function evaluateTerms(
 
 function termMatches(term: string, dish: NormalizedDish, text: string): boolean {
   if (term === "light") return dish.heaviness < 0.45;
+  if (term === "heavy") return dish.heaviness >= 0.55;
   if (term === "filling") return dish.heaviness >= 0.55;
   if (term === "spicy") return dish.spicy;
-  if (term === "vegetarian") return dish.vegetarian;
+  if (term === "vegetarian") return dish.vegetarian === true;
   if (term === "creamy") return dish.creamy;
   if (term === "fish") return dish.categories.includes("fish") || dish.proteins.some((entry) => FISH_PROTEINS.has(entry));
   if (term === "seafood") return dish.categories.includes("seafood") || dish.proteins.some((entry) => SEAFOOD_PROTEINS.has(entry));
@@ -264,6 +287,7 @@ function calculateIntentCoverage(input: {
 function extractModifierTerms(value: string): string[] {
   return unique([
     ...(LIGHT.test(value) ? ["light"] : []),
+    ...(HEAVY.test(value) && !NOT_TOO_HEAVY.test(value) ? ["heavy"] : []),
     ...(FILLING.test(value) ? ["filling"] : []),
     ...(CREAMY.test(value) ? ["creamy"] : []),
     ...(/(spicy|hot|остр\p{L}*)/iu.test(value) ? ["spicy"] : []),
@@ -282,8 +306,8 @@ function parseNegation(value: string): { affirmativeText: string; excludedTerms:
   const fragments: string[] = [];
   let affirmativeText = value;
   const patterns = [
-    /(^|[\s,;:])(?:без|without|avoid|avoiding|excluding|исключая)\s+([^,.;:]+)/giu,
-    /(^|[\s,;:])(?:не|not|no)(?!\s+(?:too\s+heavy|тяжел\p{L}*))\s+([^,.;:]+)/giu,
+    /(^|[\s,;:])(?:(?:и|and)\s+)?(?:без|without|avoid|avoiding|excluding|исключая)\s+(.+?)(?=(?:\s+(?:и|and)\s+)?(?:без|without|avoid|avoiding|excluding|исключая|не|not|no)\s+|[,.;:]|$)/giu,
+    /(^|[\s,;:])(?:(?:и|and)\s+)?(?:не|not|no)(?!\s+(?:too\s+heavy|тяжел\p{L}*))\s+(.+?)(?=(?:\s+(?:и|and)\s+)?(?:без|without|avoid|avoiding|excluding|исключая|не|not|no)\s+|[,.;:]|$)/giu,
   ];
   for (const pattern of patterns) {
     affirmativeText = affirmativeText.replace(pattern, (_match, prefix: string, fragment: string) => {

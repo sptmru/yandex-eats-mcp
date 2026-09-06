@@ -1,5 +1,11 @@
 import { canonicalValues, normalizeText, termMatchesDish, tokenize } from "./normalize.js";
-import type { DishCandidate, FoodPreference, FoodResult, RecommendFoodInput } from "./types.js";
+import type {
+  DishCandidate,
+  FoodPreference,
+  FoodResult,
+  RecommendationFilterGroup,
+  RecommendFoodInput,
+} from "./types.js";
 
 export function scoreSearchCandidate(candidate: DishCandidate, queries: string[]): FoodResult {
   const bestIntent = [...candidate.intentMatches].sort((left, right) =>
@@ -49,9 +55,17 @@ export function scoreCandidate(
   if (input.maxHeaviness !== undefined && candidate.normalized.heaviness > input.maxHeaviness) return undefined;
   if (candidate.intentMatches.some((match) => match.matchedExcludedTerms.length > 0)) return undefined;
   if ((input.avoid ?? []).some((term) => termMatchesDish(term, candidate.normalized, text))) return undefined;
+  const hasSemanticIntent = candidate.intentMatches.some((match) =>
+    match.requiredTerms.some((term) => canonicalValues(term).length > 0)
+  );
+  if (hasSemanticIntent && candidate.intentCoverage === 0) return undefined;
   if (input.categories?.length && !input.categories.some((term) => termMatchesDish(term, candidate.normalized, text))) {
     return undefined;
   }
+  if (!matchesDimension(input.cuisines, candidate.normalized.cuisines)) return undefined;
+  if (!matchesProteinDimension(input.proteins, candidate)) return undefined;
+  if (!matchesDimension(input.cookingMethods, candidate.normalized.cookingMethods)) return undefined;
+  if (!matchesAnyFilterGroup(input.anyOf, candidate, text)) return undefined;
 
   const reasons: string[] = [];
   let score = candidate.relevance * 0.22 + candidate.intentCoverage * 0.2;
@@ -169,6 +183,47 @@ function uniqueSemanticTerms(terms: string[]): string[] {
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
+  });
+}
+
+function matchesDimension(requested: string[] | undefined, actual: string[]): boolean {
+  if (!requested?.length) return true;
+  return requested.some((term) => {
+    const canonical = canonicalValues(term);
+    const values = canonical.length > 0 ? canonical : [normalizeText(term)];
+    return values.some((value) => actual.includes(value));
+  });
+}
+
+function matchesAnyFilterGroup(
+  groups: RecommendationFilterGroup[] | undefined,
+  candidate: DishCandidate,
+  text: string,
+): boolean {
+  if (!groups?.length) return true;
+  return groups.some((group) => {
+    const hasTerms = [group.categories, group.cuisines, group.proteins, group.cookingMethods]
+      .some((terms) => terms !== undefined && terms.length > 0);
+    return hasTerms &&
+      (!group.categories?.length || group.categories.some((term) => termMatchesDish(term, candidate.normalized, text))) &&
+      matchesDimension(group.cuisines, candidate.normalized.cuisines) &&
+      matchesProteinDimension(group.proteins, candidate) &&
+      matchesDimension(group.cookingMethods, candidate.normalized.cookingMethods);
+  });
+}
+
+function matchesProteinDimension(requested: string[] | undefined, candidate: DishCandidate): boolean {
+  if (!requested?.length) return true;
+  return requested.some((term) => {
+    const canonical = canonicalValues(term);
+    const values = canonical.length > 0 ? canonical : [normalizeText(term)];
+    return values.some((value) => {
+      if (candidate.normalized.proteins.includes(value)) return true;
+      if (value === "fish") return candidate.normalized.categories.includes("fish");
+      if (value === "seafood") return candidate.normalized.categories.includes("seafood");
+      if (value === "meat") return candidate.normalized.categories.includes("meat");
+      return false;
+    });
   });
 }
 

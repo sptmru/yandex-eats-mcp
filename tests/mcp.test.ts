@@ -79,6 +79,13 @@ describe("MCP contract", () => {
       expect(events?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
       const recommendations = listed.tools.find((tool) => tool.name === "recommend_food");
       expect(recommendations?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, openWorldHint: true });
+      expect(Object.keys(recommendations?.inputSchema.properties ?? {})).toEqual(expect.arrayContaining([
+        "categories",
+        "cuisines",
+        "proteins",
+        "cookingMethods",
+        "anyOf",
+      ]));
       const feedback = listed.tools.find((tool) => tool.name === "record_food_feedback");
       expect(feedback?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, openWorldHint: false });
 
