@@ -126,6 +126,39 @@ describe("YandexEatsClient HTTP contract", () => {
     expect(new Headers(calls[3]?.init?.headers).get("authorization")).toBe("Bearer web-api-value");
   });
 
+  it.each([
+    { latitude: 40.18, longitude: 44.51 },
+    { latitude: 0, longitude: 0 },
+  ])("discovers and tracks regional orders with coordinates $latitude, $longitude", async ({ latitude, longitude }) => {
+    const directory = await temporaryDirectory();
+    const cookieFile = join(directory, "cookie");
+    await writeFile(cookieFile, "Session_id=session-value");
+    const config = testConfig(directory, cookieFile, false);
+    config.eats.latitude = latitude;
+    config.eats.longitude = longitude;
+    const fakeFetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const hasRegion = new Headers(init?.headers).get("x-ya-coordinates") ===
+        `latitude=${latitude},longitude=${longitude}`;
+      if (requestUrl(input).pathname.endsWith("tracking-for-desktop")) {
+        return Promise.resolve(hasRegion
+          ? jsonResponse({ tracked_order: { order_nr: "regional-order", status: "preparing" } })
+          : jsonResponse({}, { status: 404 }));
+      }
+      return Promise.resolve(jsonResponse(hasRegion
+        ? { orders: [{ order_nr: "regional-order" }], update_settings: { order_nrs_to_update: ["regional-order"] } }
+        : { orders: [] }));
+    });
+    const client = new YandexEatsClient(config, createLogger("silent"), fakeFetch);
+    await client.initialize();
+
+    await expect(client.listOrders()).resolves.toMatchObject({
+      update_settings: { order_nrs_to_update: ["regional-order"] },
+    });
+    await expect(client.getDesktopTracking("regional-order")).resolves.toMatchObject({
+      tracked_order: { order_nr: "regional-order", status: "preparing" },
+    });
+  });
+
   it("allows an adult menu item to be added to the cart", async () => {
     const directory = await temporaryDirectory();
     const cookieFile = join(directory, "cookie");

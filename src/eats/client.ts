@@ -530,6 +530,10 @@ export class YandexEatsClient {
         "X-Taxi": `yandex-eats-mcp/0.1 platform=eats_desktop_web`,
         Origin: this.config.eats.baseUrl.origin,
         Referer: `${this.config.eats.baseUrl.origin}/`,
+        // Regional orders can be hidden or return 404 without this header.
+        ...(this.config.eats.latitude !== undefined && this.config.eats.longitude !== undefined
+          ? { "X-Ya-Coordinates": `latitude=${this.config.eats.latitude},longitude=${this.config.eats.longitude}` }
+          : {}),
         ...(await this.session.buildSensitiveHeaders()),
       };
       if (options.body !== undefined) headers["Content-Type"] = "application/json";

@@ -250,6 +250,8 @@ YANDEX_EATS_ENABLE_ORDER_MONITORING=true
 ORDER_NOTIFY_PROVIDER=telegram
 ```
 
+Configure `YANDEX_EATS_LATITUDE` and `YANDEX_EATS_LONGITUDE` for the delivery region. The client sends them as `X-Ya-Coordinates`: without this regional context, Yandex can omit an active order from the list and return 404 for its tracking endpoint even with valid authentication.
+
 The list and tracking intervals are supplied by Yandex and clamped by `YANDEX_EATS_ORDER_POLL_MIN_MS` / `YANDEX_EATS_ORDER_POLL_MAX_MS`. Network, 429, and 5xx failures use bounded backoff. List and tracking health are evaluated separately; a successful order-list request cannot clear a tracking failure. A 401/403 creates one `monitor.auth_expired` event; after the cookie is replaced, `SIGHUP` wakes the monitor immediately. Recovery is reported only after the required components have recovered.
 
 The first successful snapshot is a baseline, so deploying the monitor does not notify about historical orders. Later discoveries and fingerprint changes create monotonically sequenced events. Telegram messages mask the order number and omit address, coordinates, phone, payment, map payload, and courier identity.
